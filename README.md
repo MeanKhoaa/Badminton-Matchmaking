@@ -1,5 +1,14 @@
 # 🏸 Badminton Matchmaking
 
+## Quick Launch
+
+- **Windows**: double‑click `setup.bat`
+- **macOS / Linux**: run `./setup.sh` (first time: `chmod +x setup.sh`)
+
+> These scripts check for Python 3.10+ and then run `session_ui.py`.  
+> If Python isn’t installed, you’ll get a clear message with the download link.
+
+
 A Python tool for generating fair, varied, and session-based play orders for social badminton sessions.  
 Designed to ensure **fairness**, **variety**, and **smooth scheduling** across multiple courts.
 
