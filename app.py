@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
 """
-Badminton Matchmaking – Session & Player Input Layer (v1)
+Badminton Matchmaking – Session & Player Input Layer (v1, clean)
 
-What this file does now (phase 1):
 - Collects session variables (court_no, court_duration [minutes], player_amount)
 - Collects players (ranked by input order): name, gender (m/f)
 - Optional creation of "pairings" (couples): pick two ranks and a preference
-  ("with" = prefer to team up; "against" = prefer to face each other)
-- Saves the session + player list to an editable Markdown file
-- Can re-load from that Markdown file later
+  ("with" = same team; "against" = opposite teams)
+- Saves to an editable Markdown file AND (optionally) JSON
+- Can re-load from Markdown later to normalise/convert
 
-Notes / assumptions (can be changed later):
-- court_duration is in minutes
-- Each player can have at most one special pairing (couple) entry
-- Gender is limited to 'm' or 'f' for now (extendable later)
-- Ranking is 1..N in the order entered
-
-Next phase (separate):
-- Implement the matchmaking algorithm using this structured input
+Use:
+  python3 app.py --interactive --output players.md --json players.json
+  python3 app.py --input players.md --output players.md --json players.json
 """
 from __future__ import annotations
 
@@ -86,7 +80,6 @@ def interactive_setup() -> SessionConfig:
         gender = prompt_choice("  Gender?", ["m", "f"]).lower()
         players.append(Player(rank=r, name=name, gender=gender))
 
-    # Optional pairings (couples)
     print("\n=== Pairings (optional) ===")
     make_pairs = prompt_choice("Do you want to create any pairings now?", ["y", "n"]).lower()
     if make_pairs == "y":
@@ -135,7 +128,6 @@ MD_HEADER = (
 
 SESSION_KEYS = ["court_no", "court_duration", "player_amount"]
 
-
 def save_markdown(cfg: SessionConfig, path: str) -> None:
     lines = [MD_HEADER]
     lines.append("## Session\n")
@@ -154,7 +146,6 @@ def save_markdown(cfg: SessionConfig, path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
         f.writelines(lines)
 
-
 def _parse_session_kv(lines: List[str]) -> Tuple[dict, int]:
     """Parse simple key: value pairs for SESSION_KEYS. Returns (dict, last_index)."""
     data = {}
@@ -170,15 +161,13 @@ def _parse_session_kv(lines: List[str]) -> Tuple[dict, int]:
         if m:
             k, v = m.group(1), m.group(2)
             if k in SESSION_KEYS:
-                # strip inline comments like '  # minutes'
-                v = v.split("#", 1)[0].strip()
+                v = v.split("#", 1)[0].strip()  # strip inline comments
                 try:
                     data[k] = int(v)
                 except ValueError:
                     data[k] = v
         i += 1
     return data, i
-
 
 def _parse_md_table(lines: List[str], start_idx: int) -> List[Player]:
     # Expect header row then separator row, then data rows starting with '|'
@@ -207,15 +196,21 @@ def _parse_md_table(lines: List[str], start_idx: int) -> List[Player]:
             pref = cells[4].lower() if cells[4] else ""
             paired_with_rank = int(pwr) if pwr else None
             pairing_pref = pref if pref in {"with", "against"} else None
-            players.append(Player(rank=rank, name=name, gender=gender,
-                                  paired_with_rank=paired_with_rank, pairing_pref=pairing_pref))
+            players.append(
+                Player(
+                    rank=rank,
+                    name=name,
+                    gender=gender,
+                    paired_with_rank=paired_with_rank,
+                    pairing_pref=pairing_pref,
+                )
+            )
         except Exception:
             pass
         i += 1
     # sort by rank in case of manual edits
     players.sort(key=lambda p: p.rank)
     return players
-
 
 def load_markdown(path: str) -> SessionConfig:
     with open(path, "r", encoding="utf-8") as f:
@@ -227,7 +222,7 @@ def load_markdown(path: str) -> SessionConfig:
     players = _parse_md_table(lines, idx)
     if not players:
         raise ValueError("No players parsed from markdown table.")
-    # Validate ranks are 1..N without gaps
+    # Validate ranks are 1..N without gaps; normalise if user edited badly
     ranks = [p.rank for p in players]
     expected = list(range(1, len(players) + 1))
     if ranks != expected:
@@ -278,7 +273,6 @@ def main():
         return
 
     parser.print_help()
-
 
 if __name__ == "__main__":
     main()

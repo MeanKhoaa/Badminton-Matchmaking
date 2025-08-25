@@ -1,0 +1,175 @@
+{
+  "court_no": 4,
+  "court_duration": 120,
+  "player_amount": 24,
+  "players": [
+    {
+      "rank": 1,
+      "name": "Steven",
+      "gender": "m",
+      "paired_with_rank": null,
+      "pairing_pref": null
+    },
+    {
+      "rank": 2,
+      "name": "Duong",
+      "gender": "m",
+      "paired_with_rank": null,
+      "pairing_pref": null
+    },
+    {
+      "rank": 3,
+      "name": "Khuong",
+      "gender": "m",
+      "paired_with_rank": null,
+      "pairing_pref": null
+    },
+    {
+      "rank": 4,
+      "name": "Nam",
+      "gender": "m",
+      "paired_with_rank": 21,
+      "pairing_pref": "with"
+    },
+    {
+      "rank": 5,
+      "name": "Thu Ha",
+      "gender": "f",
+      "paired_with_rank": null,
+      "pairing_pref": null
+    },
+    {
+      "rank": 6,
+      "name": "Vinh",
+      "gender": "m",
+      "paired_with_rank": null,
+      "pairing_pref": null
+    },
+    {
+      "rank": 7,
+      "name": "Ha",
+      "gender": "m",
+      "paired_with_rank": null,
+      "pairing_pref": null
+    },
+    {
+      "rank": 8,
+      "name": "Khoa",
+      "gender": "m",
+      "paired_with_rank": null,
+      "pairing_pref": null
+    },
+    {
+      "rank": 9,
+      "name": "An",
+      "gender": "m",
+      "paired_with_rank": null,
+      "pairing_pref": null
+    },
+    {
+      "rank": 10,
+      "name": "Holly",
+      "gender": "f",
+      "paired_with_rank": null,
+      "pairing_pref": null
+    },
+    {
+      "rank": 11,
+      "name": "Trang",
+      "gender": "f",
+      "paired_with_rank": null,
+      "pairing_pref": null
+    },
+    {
+      "rank": 12,
+      "name": "Gia",
+      "gender": "f",
+      "paired_with_rank": null,
+      "pairing_pref": null
+    },
+    {
+      "rank": 13,
+      "name": "Nguyen",
+      "gender": "m",
+      "paired_with_rank": null,
+      "pairing_pref": null
+    },
+    {
+      "rank": 14,
+      "name": "Emma",
+      "gender": "f",
+      "paired_with_rank": null,
+      "pairing_pref": null
+    },
+    {
+      "rank": 15,
+      "name": "Phu",
+      "gender": "m",
+      "paired_with_rank": null,
+      "pairing_pref": null
+    },
+    {
+      "rank": 16,
+      "name": "Ngan",
+      "gender": "f",
+      "paired_with_rank": null,
+      "pairing_pref": null
+    },
+    {
+      "rank": 17,
+      "name": "Henry",
+      "gender": "m",
+      "paired_with_rank": null,
+      "pairing_pref": null
+    },
+    {
+      "rank": 18,
+      "name": "Tuan",
+      "gender": "m",
+      "paired_with_rank": 19,
+      "pairing_pref": "against"
+    },
+    {
+      "rank": 19,
+      "name": "Que Anh",
+      "gender": "f",
+      "paired_with_rank": 18,
+      "pairing_pref": "against"
+    },
+    {
+      "rank": 20,
+      "name": "By",
+      "gender": "f",
+      "paired_with_rank": null,
+      "pairing_pref": null
+    },
+    {
+      "rank": 21,
+      "name": "Boi",
+      "gender": "f",
+      "paired_with_rank": 4,
+      "pairing_pref": "with"
+    },
+    {
+      "rank": 22,
+      "name": "Thy",
+      "gender": "f",
+      "paired_with_rank": null,
+      "pairing_pref": null
+    },
+    {
+      "rank": 23,
+      "name": "Linh",
+      "gender": "f",
+      "paired_with_rank": null,
+      "pairing_pref": null
+    },
+    {
+      "rank": 24,
+      "name": "Quynh",
+      "gender": "f",
+      "paired_with_rank": null,
+      "pairing_pref": null
+    }
+  ]
+}
