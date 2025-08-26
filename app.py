@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Badminton Matchmaking – Session & Player Input Layer (v1, clean)
+Badminton Matchmaking – Player/Input Builder (auto-reset)
 
-- Collects session variables (court_no, court_duration [minutes], player_amount)
-- Collects players (ranked by input order): name, gender (m/f)
-- Optional creation of "pairings" (couples): pick two ranks and a preference
-  ("with" = same team; "against" = opposite teams)
-- Saves to an editable Markdown file AND (optionally) JSON
-- Can re-load from Markdown later to normalise/convert
+What’s special in this version:
+- Every time you run this file, it WILL DELETE any existing files in the repo root
+  that match:  players*.json  and  players*.md
+- Then it will recreate fresh  players.json  and  players.md  from your inputs.
 
-Use:
-  python3 app.py --interactive --output players.md --json players.json
-  python3 app.py --input players.md --output players.md --json players.json
+Why: You said you'll run app.py whenever the player base changes, so we reset
+the player list artifacts each run to avoid stale state.
+
+No external deps; Python 3.10+.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -20,17 +20,21 @@ import dataclasses
 import json
 import os
 import re
-from typing import List, Optional, Tuple
+import sys
+from glob import glob
+from typing import List, Optional, Dict
 
-# ---------- Data model ----------
+
+# ---------------------- Data models ----------------------
 
 @dataclasses.dataclass
 class Player:
     rank: int
     name: str
     gender: str  # 'm' or 'f'
-    paired_with_rank: Optional[int] = None  # rank of the paired player
-    pairing_pref: Optional[str] = None      # 'with' or 'against'
+    paired_with_rank: Optional[int] = None
+    pairing_pref: Optional[str] = None  # 'with' | 'against' | None
+
 
 @dataclasses.dataclass
 class SessionConfig:
@@ -39,240 +43,162 @@ class SessionConfig:
     player_amount: int
     players: List[Player]
 
-# ---------- Helpers ----------
 
-def prompt_int(prompt: str, min_val: Optional[int] = None, max_val: Optional[int] = None) -> int:
+# ---------------------- Markdown helpers ----------------------
+
+def to_markdown(cfg: SessionConfig) -> str:
+    lines: List[str] = []
+    lines.append("# Players\n\n")
+    lines.append(f"court_no: {cfg.court_no}\n")
+    lines.append(f"court_duration: {cfg.court_duration}\n")
+    lines.append(f"player_amount: {cfg.player_amount}\n\n")
+    lines.append("| Rank | Name | Gender | Paired_with_rank | Pairing_pref |\n")
+    lines.append("|----:|------|:------:|:----------------:|:------------:|\n")
+    for p in sorted(cfg.players, key=lambda x: x.rank):
+        pwr = "" if p.paired_with_rank is None else str(p.paired_with_rank)
+        pref = "" if p.pairing_pref is None else p.pairing_pref
+        lines.append(f"| {p.rank} | {p.name} | {p.gender} | {pwr} | {pref} |\n")
+    lines.append("\n")
+    return "".join(lines)
+
+
+# ---------------------- Interactive input ----------------------
+
+def prompt_int(prompt: str, min_val: int, max_val: int | None = None, default: int | None = None) -> int:
     while True:
-        raw = input(prompt).strip()
-        if not raw.isdigit():
-            print("Please enter a whole number.")
+        raw = input(f"{prompt}{f' [{default}]' if default is not None else ''}: ").strip()
+        if raw == "" and default is not None:
+            return default
+        if not re.fullmatch(r"\d+", raw):
+            print("  Please enter an integer.")
             continue
-        value = int(raw)
-        if min_val is not None and value < min_val:
-            print(f"Value must be ≥ {min_val}.")
+        val = int(raw)
+        if val < min_val or (max_val is not None and val > max_val):
+            print(f"  Please enter a value between {min_val} and {max_val or '∞'}.")
             continue
-        if max_val is not None and value > max_val:
-            print(f"Value must be ≤ {max_val}.")
-            continue
-        return value
+        return val
 
-def prompt_choice(prompt: str, choices: List[str]) -> str:
-    choices_lower = [c.lower() for c in choices]
+def prompt_str(prompt: str, choices: List[str] | None = None) -> str:
     while True:
-        raw = input(f"{prompt} {choices} ").strip().lower()
-        if raw in choices_lower:
-            return raw
-        print(f"Please choose one of: {choices}")
+        s = input(f"{prompt}: ").strip()
+        if s == "":
+            print("  Cannot be empty.")
+            continue
+        if choices and s.lower() not in [c.lower() for c in choices]:
+            print(f"  Please enter one of: {', '.join(choices)}")
+            continue
+        return s
 
-# ---------- Interactive input ----------
-
-def interactive_setup() -> SessionConfig:
-    print("=== Session Setup ===")
-    court_no = prompt_int("Number of courts (court_no): ", min_val=1)
-    court_duration = prompt_int("Duration of entire session in minutes (court_duration): ", min_val=1)
-    player_amount = prompt_int("Total number of players (player_amount): ", min_val=1)
-
+def collect_players(player_amount: int) -> List[Player]:
     players: List[Player] = []
-    print("\n=== Enter Players (in rank order) ===")
+    print("\n=== Enter players in rank order (1 = strongest) ===")
     for r in range(1, player_amount + 1):
-        print(f"Player Rank {r}")
-        name = input("  Name: ").strip()
-        gender = prompt_choice("  Gender?", ["m", "f"]).lower()
+        name = prompt_str(f"Rank {r} name")
+        gender = prompt_str("  gender ['m' or 'f']", choices=["m", "f"]).lower()
         players.append(Player(rank=r, name=name, gender=gender))
-
-    print("\n=== Pairings (optional) ===")
-    make_pairs = prompt_choice("Do you want to create any pairings now?", ["y", "n"]).lower()
+    # Optional couples
+    print("\n=== Pairings (couples) – optional ===")
+    make_pairs = input("Create any pairings now? [y/n]: ").strip().lower()
     if make_pairs == "y":
         while True:
-            print("Add a pairing by entering two ranks (e.g., 3 7). Leave blank to stop.")
-            raw = input("  Pair (rank_a rank_b): ").strip()
-            if not raw:
+            raw = input("  Enter two ranks to pair (e.g., '3 7'), or blank to stop: ").strip()
+            if raw == "":
                 break
-            try:
-                a_str, b_str = raw.split()
-                a, b = int(a_str), int(b_str)
-            except ValueError:
+            parts = raw.split()
+            if len(parts) != 2 or not all(p.isdigit() for p in parts):
                 print("  Please enter exactly two integers like '3 7'.")
                 continue
-            if a == b:
-                print("  Cannot pair a player with themselves.")
+            a, b = int(parts[0]), int(parts[1])
+            if not (1 <= a <= player_amount and 1 <= b <= player_amount) or a == b:
+                print("  Invalid ranks.")
                 continue
-            if not (1 <= a <= player_amount and 1 <= b <= player_amount):
-                print("  Ranks must be within 1..player_amount.")
+            pref = prompt_str("  Preference ['with' = same team, 'against' = opposite]", choices=["with", "against"]).lower()
+            pa, pb = players[a - 1], players[b - 1]
+            # prevent multiple pairings on same person
+            if pa.paired_with_rank not in (None, b) or pb.paired_with_rank not in (None, a):
+                print("  One of these players already has a pairing. Choose a different pair or edit later.")
                 continue
-            pa = players[a - 1]
-            pb = players[b - 1]
-            if pa.paired_with_rank is not None or pb.paired_with_rank is not None:
-                print("  One of these players already has a pairing. Remove it first (edit file later) or choose others.")
-                continue
-            pref = prompt_choice("  Preference? ('with' = same team, 'against' = opposite)", ["with", "against"]).lower()
             pa.paired_with_rank = b
-            pa.pairing_pref = pref
             pb.paired_with_rank = a
+            pa.pairing_pref = pref
             pb.pairing_pref = pref
             print(f"  Paired rank {a} and {b} with preference '{pref}'.")
+    return players
 
-    return SessionConfig(
+
+# ---------------------- Reset helpers ----------------------
+
+def delete_old_player_artifacts():
+    """
+    Remove any players*.json and players*.md that live in the repo ROOT (current dir).
+    Does NOT touch files inside outputs/ or logs/.
+    """
+    patterns = ["players*.json", "players*.md"]
+    removed: list[str] = []
+    for pat in patterns:
+        for path in glob(pat):
+            # Skip subdirectories just in case
+            if os.path.isdir(path):
+                continue
+            try:
+                os.remove(path)
+                removed.append(path)
+            except Exception as e:
+                print(f"  Warning: could not delete {path}: {e}")
+    if removed:
+        print("Reset: removed old player files -> " + ", ".join(sorted(removed)))
+    else:
+        print("Reset: no old player files to remove.")
+
+
+# ---------------------- CLI ----------------------
+
+def main():
+    ap = argparse.ArgumentParser(description="Badminton matchmaking – input builder (auto-reset each run)")
+    ap.add_argument("--interactive", action="store_true", help="Run interactive setup in terminal")
+    # Kept for compatibility; we always overwrite players.json / players.md anyway
+    ap.add_argument("--output", help="(ignored – we now always write players.md at repo root)")
+    ap.add_argument("--json", help="(ignored – we now always write players.json at repo root)")
+    args = ap.parse_args()
+
+    # Always reset old player artifacts in repo root at the start of every run
+    delete_old_player_artifacts()
+
+    # Interactive mode (default if no args)
+    if not args.interactive:
+        print("Tip: run with '--interactive' for guided input.\nProceeding interactively now...")
+    court_no = prompt_int("Number of courts booked", 1, 50)
+    court_duration = prompt_int("Duration of entire session (minutes)", 10, 24 * 60)
+    player_amount = prompt_int("Number of players", 4, 200)
+
+    players = collect_players(player_amount)
+
+    cfg = SessionConfig(
         court_no=court_no,
         court_duration=court_duration,
         player_amount=player_amount,
         players=players,
     )
 
-# ---------- Markdown I/O ----------
+    # Always write to players.md / players.json at repo root (overwrite)
+    md_path = "players.md"
+    json_path = "players.json"
 
-MD_HEADER = (
-    "# Badminton Social – Session & Players\n\n"
-    "Edit this file freely. Keep the header key: value lines and the table columns.\n\n"
-)
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(to_markdown(cfg))
+    print(f"Saved: {os.path.abspath(md_path)}")
 
-SESSION_KEYS = ["court_no", "court_duration", "player_amount"]
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "court_no": cfg.court_no,
+            "court_duration": cfg.court_duration,
+            "player_amount": cfg.player_amount,
+            "players": [dataclasses.asdict(p) for p in cfg.players],
+        }, f, indent=2)
+    print(f"Also wrote JSON to: {os.path.abspath(json_path)}")
 
-def save_markdown(cfg: SessionConfig, path: str) -> None:
-    lines = [MD_HEADER]
-    lines.append("## Session\n")
-    lines.append(f"court_no: {cfg.court_no}\n")
-    lines.append(f"court_duration: {cfg.court_duration}  # minutes\n")
-    lines.append(f"player_amount: {cfg.player_amount}\n\n")
+    print("\nNext step: run 'python session_ui.py' to generate the play order.\n")
 
-    lines.append("## Players\n")
-    lines.append("| Rank | Name | Gender | PairedWithRank | PairPref |\n")
-    lines.append("| ---- | ---- | ------ | -------------- | -------- |\n")
-    for p in cfg.players:
-        pwr = "" if p.paired_with_rank is None else str(p.paired_with_rank)
-        pref = "" if p.pairing_pref is None else p.pairing_pref
-        lines.append(f"| {p.rank} | {p.name} | {p.gender} | {pwr} | {pref} |\n")
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-
-def _parse_session_kv(lines: List[str]) -> Tuple[dict, int]:
-    """Parse simple key: value pairs for SESSION_KEYS. Returns (dict, last_index)."""
-    data = {}
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        if not line or line.startswith("#"):
-            i += 1
-            continue
-        if line.lower().startswith("## players"):
-            break
-        m = re.match(r"^(\w+):\s*(.+)$", line)
-        if m:
-            k, v = m.group(1), m.group(2)
-            if k in SESSION_KEYS:
-                v = v.split("#", 1)[0].strip()  # strip inline comments
-                try:
-                    data[k] = int(v)
-                except ValueError:
-                    data[k] = v
-        i += 1
-    return data, i
-
-def _parse_md_table(lines: List[str], start_idx: int) -> List[Player]:
-    # Expect header row then separator row, then data rows starting with '|'
-    players: List[Player] = []
-    i = start_idx
-    # advance to first table header line
-    while i < len(lines) and not lines[i].lstrip().startswith("|"):
-        i += 1
-    if i >= len(lines):
-        return players
-    # skip header + separator
-    i += 2
-    while i < len(lines):
-        line = lines[i].strip()
-        if not line or not line.startswith("|"):
-            break
-        cells = [c.strip() for c in line.strip("|").split("|")]
-        if len(cells) < 5:
-            i += 1
-            continue
-        try:
-            rank = int(cells[0])
-            name = cells[1]
-            gender = cells[2].lower()
-            pwr = cells[3]
-            pref = cells[4].lower() if cells[4] else ""
-            paired_with_rank = int(pwr) if pwr else None
-            pairing_pref = pref if pref in {"with", "against"} else None
-            players.append(
-                Player(
-                    rank=rank,
-                    name=name,
-                    gender=gender,
-                    paired_with_rank=paired_with_rank,
-                    pairing_pref=pairing_pref,
-                )
-            )
-        except Exception:
-            pass
-        i += 1
-    # sort by rank in case of manual edits
-    players.sort(key=lambda p: p.rank)
-    return players
-
-def load_markdown(path: str) -> SessionConfig:
-    with open(path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    kv, idx = _parse_session_kv(lines)
-    missing = [k for k in SESSION_KEYS if k not in kv]
-    if missing:
-        raise ValueError(f"Missing session keys in markdown: {missing}")
-    players = _parse_md_table(lines, idx)
-    if not players:
-        raise ValueError("No players parsed from markdown table.")
-    # Validate ranks are 1..N without gaps; normalise if user edited badly
-    ranks = [p.rank for p in players]
-    expected = list(range(1, len(players) + 1))
-    if ranks != expected:
-        print("Warning: ranks are non-sequential after edits; normalising to 1..N by order.")
-        for i, p in enumerate(players, start=1):
-            p.rank = i
-    return SessionConfig(
-        court_no=int(kv["court_no"]),
-        court_duration=int(kv["court_duration"]),
-        player_amount=int(kv["player_amount"]),
-        players=players,
-    )
-
-# ---------- JSON export (optional) ----------
-
-def save_json(cfg: SessionConfig, path: str) -> None:
-    obj = dataclasses.asdict(cfg)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2)
-
-# ---------- CLI ----------
-
-def main():
-    parser = argparse.ArgumentParser(description="Badminton matchmaking – input builder")
-    parser.add_argument("--interactive", action="store_true", help="Run interactive setup in terminal")
-    parser.add_argument("--input", type=str, help="Load from an existing markdown file")
-    parser.add_argument("--output", type=str, default="players.md", help="Where to save markdown output")
-    parser.add_argument("--json", type=str, help="Also write a JSON copy to this path")
-    args = parser.parse_args()
-
-    if args.interactive:
-        cfg = interactive_setup()
-        save_markdown(cfg, args.output)
-        if args.json:
-            save_json(cfg, args.json)
-        print(f"\nSaved session + players to: {os.path.abspath(args.output)}")
-        if args.json:
-            print(f"Also wrote JSON to: {os.path.abspath(args.json)}")
-        return
-
-    if args.input:
-        cfg = load_markdown(args.input)
-        # Optionally re-save to normalise formatting
-        save_markdown(cfg, args.output)
-        if args.json:
-            save_json(cfg, args.json)
-        print(f"Loaded from {args.input} and normalised to {args.output}.")
-        return
-
-    parser.print_help()
 
 if __name__ == "__main__":
     main()

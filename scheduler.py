@@ -1,30 +1,21 @@
 #!/usr/bin/env python3
 """
-Badminton Matchmaking – Scheduler (v8 knobs)
-- Play-order with sliding window (no repeats across any `courts` consecutive matches).
-- Fairness pacing (each player's appearances track expected pace).
-- Per-player 3:1 intensity (close:diverse).
-- Teammate-pool ratios (G/A/P mixing) with tunable boost/penalty.
-- Teammate variety controls (hard cap + cooldown).
-- Couples (with/against), gender priority (relaxable), dedupe full matchups.
-- End-of-run debug summary.
+Badminton Matchmaking – Scheduler (Per-Pool Ratios + Variety Cap + Upgrades)
 
-Run example:
-  python3 scheduler.py --input players.json --output-md play_order.md \
-    --avg 10 --rank-tol 1 --seed 7 --debug \
-    --teammate-cap-ratio 0.25 --teammate-cooldown 12 --max-ahead-margin 0.5
+Upgrades included:
+- Adaptive weights (pool quotas & fairness) – helps late-session catch-up
+- Opponent variety penalty – avoid facing the same people repeatedly
+- Per-pool rank tolerance – slightly looser for G<->P to enable 'opp' quotas
+- Rolling-horizon selection – choose up to court_no matches at once
+- Smarter gender priority – soft bonus by feasibility; can relax when needed
+
+Use:
+  python3 scheduler.py --input players.json --output-md schedule.md
 """
-from __future__ import annotations
 
-import argparse
-import dataclasses
-import json
-import math
-import os
-import random
-import re
+from __future__ import annotations
+import argparse, dataclasses, json, os, random, re, math
 from collections import defaultdict, deque
-from itertools import combinations
 from typing import Dict, List, Optional, Tuple, Set
 
 # ---------- Data model ----------
@@ -49,23 +40,57 @@ class SessionConfig:
 @dataclasses.dataclass
 class ScheduleParams:
     average_match_minutes: int = 10
+    # base rank tolerance
     rank_tolerance: int = 1
-    teammate_close_delta: int = 2
-    teammate_far_threshold: int = 3
+    # extra tolerance for G<->P matches (helps achieve 'opp' quotas)
+    rank_tolerance_opp_extra: int = 1
+
     enforce_gender_priority: bool = True
     random_seed: Optional[int] = 42
 
-    # pacing window = courts - 1 (guarantees no repeats inside any `courts` games)
-    max_ahead_margin: float = 0.5  # stricter pacing guard (was 1.0)
+    # pool split (Good, Average, Poor)
+    pool_split_g: float = 0.25
+    pool_split_a: float = 0.45
+    pool_split_p: float = 0.30
 
-    # teammate variety knobs
-    teammate_cap_ratio: float = 0.25  # ≈2 with ~8 games/player
+    # **Per-pool teammate mix ratios** (Same, Avg, Opp)
+    # Good
+    ratio_same_G: float = 0.50
+    ratio_avg_G:  float = 0.25
+    ratio_opp_G:  float = 0.25
+    # Average
+    ratio_same_A: float = 0.50
+    ratio_avg_A:  float = 0.25
+    ratio_opp_A:  float = 0.25
+    avg_opp_split: float = 0.5  # Average player's Opp split G/P
+    # Poor
+    ratio_same_P: float = 0.20
+    ratio_avg_P:  float = 0.55
+    ratio_opp_P:  float = 0.25
+
+    # weights (base)
+    w_pool_quota: float = 15.0     # steer to pool quotas
+    w_variety: float    = 12.0     # soft repeat penalty strength (teammates)
+    w_opp_variety: float = 6.0     # soft repeat penalty strength (opponents)
+    w_fair: float       = 8.0      # fairness / catch-up
+    w_gender_bonus: float = 2.0    # soft bonus if match fits the preferred gender mode
+
+    # teammate variety hard cap (same teammates per session)
     teammate_cap_override: Optional[int] = None
-    teammate_cooldown_games: Optional[int] = None  # None -> auto = courts*3 (default)
+    teammate_cap_ratio: float = 0.25  # else cap = ceil(target_per_player * ratio)
 
-    # pool mix steering
-    pool_mix_boost: float = 1.0   # multiply positive nudges
-    pool_mix_penalty: float = 1.0 # multiply penalties
+    # ----- Adaptive weights -----
+    adaptive_on: bool = True
+    # how strongly to boost pool quotas for behind players (0.0-1.0 sensible)
+    adapt_pool_strength: float = 0.5
+    # how strongly to boost fairness for behind players
+    adapt_fair_strength: float = 0.35
+    # when to consider "behind" (in games) before boosting
+    adapt_games_threshold: float = 1.0
+
+    # ----- Rolling horizon -----
+    # choose up to this many matches per step (default = number of courts)
+    horizon_matches: Optional[int] = None
 
 # ---------- Loader ----------
 
@@ -104,8 +129,7 @@ def _load_md_minimal(path: str) -> SessionConfig:
             if not line.strip().startswith("|"):
                 break
             cells = [c.strip() for c in line.strip("|\n").split("|")]
-            if len(cells) < 5:
-                continue
+            if len(cells) < 5: continue
             rank = int(cells[0]); name = cells[1]; gender = cells[2].lower()
             pwr = cells[3]; pref = cells[4].lower() if cells[4] else ""
             paired_with_rank = int(pwr) if pwr else None
@@ -122,17 +146,18 @@ def _load_md_minimal(path: str) -> SessionConfig:
 # ---------- Helpers ----------
 
 def gender_of_pair(a: Player, b: Player) -> str:
-    kinds = "".join(sorted([a.gender, b.gender]))  # 'ff','fm','mm'
+    kinds = "".join(sorted([a.gender, b.gender]))
     return "mf" if kinds == "fm" else kinds
 
 def team_avg(a: Player, b: Player) -> float:
     return (a.rank + b.rank) / 2.0
 
-def pool_of_rank(rk: int) -> str:
-    # Pools: Good 1–8, Average 9–16, Poor 17–24
-    if rk <= 8: return "G"
-    if rk <= 16: return "A"
-    return "P"
+def classify_pool(rank: int, n_players: int, ps: ScheduleParams) -> str:
+    g_cut = max(1, int(ps.pool_split_g * n_players))
+    a_cut = g_cut + max(1, int(ps.pool_split_a * n_players))
+    if rank <= g_cut: return "G"
+    elif rank <= a_cut: return "A"
+    else: return "P"
 
 # ---------- Core ----------
 
@@ -151,21 +176,18 @@ class Team:
 class Match:
     team1: Team
     team2: Team
-    intensity: str  # 'close' | 'diverse'
     def key(self) -> Tuple[Tuple[int,int],Tuple[int,int]]:
         k1, k2 = self.team1.key(), self.team2.key()
         return tuple(sorted([k1, k2]))  # type: ignore[return-value]
 
 class Scheduler:
-    def __init__(self, cfg: SessionConfig, params: ScheduleParams, debug: bool = False):
+    def __init__(self, cfg: SessionConfig, params: ScheduleParams):
         self.cfg = cfg
         self.p = params
-        self.debug = debug
-        if self.p.random_seed is not None:
-            random.seed(self.p.random_seed)
+        if self.p.random_seed is not None: random.seed(self.p.random_seed)
 
         self.players: List[Player] = list(cfg.players)
-        self.N = len(self.players)
+        self.players_by_rank = {pl.rank: pl for pl in self.players}
 
         # Couples
         self.couple: Dict[int, Tuple[int, str]] = {}
@@ -173,432 +195,475 @@ class Scheduler:
             if pl.paired_with_rank is not None and pl.pairing_pref in {"with", "against"}:
                 self.couple[pl.rank] = (pl.paired_with_rank, pl.pairing_pref)
 
+        # Stats
+        self.games_played: Dict[int, int] = defaultdict(int)
+        self.teammate_counts: Dict[frozenset[int], int] = defaultdict(int)
+        self.opponent_counts: Dict[frozenset[int], int] = defaultdict(int)  # NEW
+        self.used_match_keys: Set[Tuple[Tuple[int,int],Tuple[int,int]]] = set()
+
         # Totals
         self.rounds_total = max(1, self.cfg.court_duration // self.p.average_match_minutes)
         self.matches_total = self.rounds_total * self.cfg.court_no
         self.appearances_total = self.matches_total * 4
-        self.target_per_player = self.appearances_total / self.N  # float
+        self.target_per_player = self.appearances_total / len(self.players)
 
-        # Per-player intensity targets
-        self.target_close = int(round(0.75 * self.target_per_player))
-        self.target_diverse = max(0, int(round(0.25 * self.target_per_player)))
+        # Variety cap
+        self.teammate_cap = (
+            self.p.teammate_cap_override
+            if self.p.teammate_cap_override is not None
+            else max(1, math.ceil(self.target_per_player * self.p.teammate_cap_ratio))
+        )
 
-        # Sliding window for availability (courts - 1)
-        self.window_len = max(1, self.cfg.court_no - 1)
+        # Sliding window
+        self.window_len = max(1, self.cfg.court_no)
         self.window: deque[List[int]] = deque(maxlen=self.window_len)
 
-        # Stats
-        self.games_played: Dict[int, int] = defaultdict(int)
-        self.close_count: Dict[int, int] = defaultdict(int)
-        self.diverse_count: Dict[int, int] = defaultdict(int)
-        self.teammate_counts: Dict[frozenset[int], int] = defaultdict(int)  # pair -> times teamed
-        self.used_match_keys: Set[Tuple[Tuple[int,int],Tuple[int,int]]] = set()
+        # Pools + per-player quotas
+        self.pool_tag: Dict[int, str] = {
+            pl.rank: classify_pool(pl.rank, len(self.players), self.p) for pl in self.players
+        }
+        T = self.target_per_player
+        self.pool_targets: Dict[int, Dict[str, float]] = {}
+        self.pool_counts:  Dict[int, Dict[str, float]] = {}
+        for pl in self.players:
+            tag = self.pool_tag[pl.rank]
+            if tag == "G":
+                same, avg, opp = self.p.ratio_same_G*T, self.p.ratio_avg_G*T, self.p.ratio_opp_G*T
+                opp_g, opp_p = 0.0, opp  # G opp is vs P
+            elif tag == "A":
+                same, avg, opp = self.p.ratio_same_A*T, self.p.ratio_avg_A*T, self.p.ratio_opp_A*T
+                opp_g, opp_p = opp*self.p.avg_opp_split, opp*(1.0 - self.p.avg_opp_split)
+            else:  # P
+                same, avg, opp = self.p.ratio_same_P*T, self.p.ratio_avg_P*T, self.p.ratio_opp_P*T
+                opp_g, opp_p = opp, 0.0  # P opp is vs G
+            self.pool_targets[pl.rank] = {"same": same, "avg": avg, "opp_g": opp_g, "opp_p": opp_p}
+            self.pool_counts[pl.rank]  = {"same": 0.0, "avg": 0.0, "opp_g": 0.0, "opp_p": 0.0}
 
-        # Teammate pool tallies per player
-        self.with_G: Dict[int, int] = defaultdict(int)
-        self.with_A: Dict[int, int] = defaultdict(int)
-        self.with_P: Dict[int, int] = defaultdict(int)
+        # Horizon
+        self.horizon = self.p.horizon_matches or self.cfg.court_no
 
-        # Teammate cap & cooldown
-        base_cap = math.ceil(self.target_per_player * self.p.teammate_cap_ratio)
-        self.teammate_cap = self.p.teammate_cap_override or max(1, base_cap)
-        default_cooldown = self.cfg.court_no * 3
-        self.cooldown_len = self.p.teammate_cooldown_games or default_cooldown
-        self.recent_pairs: deque[frozenset[int]] = deque(maxlen=self.cooldown_len)
+    # ----- utilities -----
 
-        # debug counters
-        self.dstats = defaultdict(int)
+    def _rank_tolerance_for(self, t1: Team, t2: Team) -> int:
+        # base + extra if it's a pure G<->P clash (helps satisfy opp quotas)
+        pools = {self.pool_tag[t1.a.rank], self.pool_tag[t1.b.rank],
+                 self.pool_tag[t2.a.rank], self.pool_tag[t2.b.rank]}
+        # if any team has mixed pools, use base; extra only for clear G vs P
+        t1p = {self.pool_tag[t1.a.rank], self.pool_tag[t1.b.rank]}
+        t2p = {self.pool_tag[t2.a.rank], self.pool_tag[t2.b.rank]}
+        base = self.p.rank_tolerance
+        if t1p == {"G"} and t2p == {"P"}: return base + self.p.rank_tolerance_opp_extra
+        if t1p == {"P"} and t2p == {"G"}: return base + self.p.rank_tolerance_opp_extra
+        return base
 
-    # ---- debug ----
-    def dbg(self, *args):
-        if self.debug:
-            print("[DBG]", *args)
-
-    # ---- pacing helpers ----
-    def expected_pace(self, match_idx: int) -> float:
-        return ((match_idx + 1) * 4) / self.N
-
-    def pace_ahead(self, rk: int, match_idx: int) -> float:
-        return self.games_played[rk] - self.expected_pace(match_idx)
-
-    # ---- availability under window ----
     def _available_players_window(self) -> List[Player]:
         blocked: Set[int] = set()
-        for ranks in self.window:
-            blocked.update(ranks)
+        for ranks in self.window: blocked.update(ranks)
         avail = [pl for pl in self.players if pl.rank not in blocked]
-        # Prefer those behind on total usage (and a little randomness)
-        avail.sort(key=lambda p: (self.games_played[p.rank], random.random()))
+        # prefer fewer games (then small jitter)
+        def sk(pl: Player):
+            gp = self.games_played[pl.rank]
+            diff = gp - self.target_per_player
+            return (gp, abs(diff), random.random())
+        avail.sort(key=sk)
         return avail
 
-    # ---- intensity fitness (3:1) ----
-    def _intensity_bonus(self, intensity: str, ranks: List[int]) -> float:
-        bonus = 0.0
-        for rk in ranks:
-            if intensity == "close":
-                deficit = self.target_close - self.close_count[rk]
-                bonus += 3.0 * (1 if deficit > 0 else -min(2, abs(deficit)))
-                if self.diverse_count[rk] < self.target_diverse and deficit <= 0:
-                    bonus -= 2.0
-            else:
-                deficit = self.target_diverse - self.diverse_count[rk]
-                bonus += 4.0 * (1 if deficit > 0 else -min(2, abs(deficit)))
-                if self.close_count[rk] < self.target_close and deficit <= 0:
-                    bonus -= 1.5
-        return bonus
+    def _gender_preference(self, avail: List[Player]) -> Optional[str]:
+        # Choose a feasible mode with heuristic preference order; return None to disable bonus.
+        counts = {"m": sum(1 for p in avail if p.gender == "m"),
+                  "f": sum(1 for p in avail if p.gender == "f")}
+        modes = []
+        if counts["m"] >= 4: modes.append("mm")
+        if counts["m"] >= 2 and counts["f"] >= 2: modes.append("mf")
+        if counts["f"] >= 4: modes.append("ff")
+        if not modes: return None
+        # Prefer the mode that equalizes usage (rotate by random choice)
+        random.shuffle(modes)
+        return modes[0]
 
-    # ---- teammate-pool fitness ----
-    def _pool_bonus_for_pair(self, a: Player, b: Player) -> float:
-        """Good: ~25% with Poor; Poor: ~25% with Good; Avg: some A-with-A but mix with G/P."""
-        boost = self.p.pool_mix_boost
-        pen  = self.p.pool_mix_penalty
+    # ----- candidate generation -----
 
-        def bonus_for(p: Player, mate: Player) -> float:
-            pr = p.rank; mr = mate.rank
-            pp = pool_of_rank(pr); mp = pool_of_rank(mr)
-            tot = max(1, self.games_played[pr])
-            propG = self.with_G[pr] / tot
-            propA = self.with_A[pr] / tot
-            propP = self.with_P[pr] / tot
-            if pp == "G":
-                wantP = 0.25
-                if mp == "P":
-                    return +5.0*boost if propP < wantP else -4.0*pen
-                else:
-                    return +3.0*boost if (1 - propP) < 0.75 else -2.0*pen
-            elif pp == "P":
-                wantG = 0.25
-                if mp == "G":
-                    return +5.0*boost if propG < wantG else -4.0*pen
-                else:
-                    return +3.0*boost if (1 - propG) < 0.75 else -2.0*pen
-            else:  # Average
-                # Keep ~25% with A, rest spread G/P
-                if mp == "A":
-                    return +2.5*boost if propA < 0.25 else -2.0*pen
-                else:
-                    return +2.0*boost if (1 - propA) < 0.75 else -1.5*pen
-
-        return bonus_for(a, b) + bonus_for(b, a)
-
-    # ---- teammate variety checks ----
-    def _pair_blocked_by_variety(self, t: 'Team') -> bool:
-        pair = frozenset([t.a.rank, t.b.rank])
-        if self.teammate_counts[pair] >= self.teammate_cap:
-            return True
-        if pair in self.recent_pairs:
-            return True
-        return False
-
-    # ---- candidate teams ----
-    def _gen_candidate_teams(self, avail: List[Player], intensity: str, want_gender: Optional[str]) -> List[Team]:
+    def _gen_candidate_teams(self, avail: List[Player]) -> List[Team]:
         teams: List[Team] = []
         n = len(avail)
         for i in range(n):
             for j in range(i + 1, n):
                 a, b = avail[i], avail[j]
-                diff = abs(a.rank - b.rank)
-                if intensity == "close" and diff > self.p.teammate_close_delta:
-                    continue
-                if intensity == "diverse" and diff <= self.p.teammate_far_threshold:
-                    continue
-                # 'against' couples cannot be same team
-                if a.rank in self.couple and self.couple[a.rank] == (b.rank, "against"):
-                    continue
-                if b.rank in self.couple and self.couple[b.rank] == (a.rank, "against"):
-                    continue
-                g = gender_of_pair(a, b)
-                if want_gender and g != want_gender:
-                    continue
-                t = Team(a, b)
-                if self._pair_blocked_by_variety(t):
-                    continue
-                teams.append(t)
+                # respect 'against' couples (cannot be same team)
+                if a.rank in self.couple and self.couple[a.rank] == (b.rank, "against"): continue
+                if b.rank in self.couple and self.couple[b.rank] == (a.rank, "against"): continue
+                teams.append(Team(a, b))
         return teams
 
-    # ---- score two teams ----
-    def _pair_teams(self, teams: List[Team], rank_tolerance: int, want_gender: Optional[str],
-                    intensity: str, match_idx: int) -> Optional[Match]:
-        best: Optional[Tuple[float, Match]] = None
+    # ----- adaptive multipliers -----
+
+    def _player_fair_boost(self, rank: int) -> float:
+        if not self.p.adaptive_on: return 1.0
+        gp = self.games_played[rank]
+        deficit = max(0.0, (self.target_per_player - gp) - self.p.adapt_games_threshold)
+        return 1.0 + self.p.adapt_fair_strength * (deficit / max(1.0, self.target_per_player))
+
+    def _player_pool_boosts(self, rank: int) -> Dict[str, float]:
+        if not self.p.adaptive_on:
+            return {"same":1.0,"avg":1.0,"opp_g":1.0,"opp_p":1.0}
+        tgt = self.pool_targets[rank]; done = self.pool_counts[rank]
+        boosts = {}
+        for k in ["same","avg","opp_g","opp_p"]:
+            deficit = max(0.0, tgt[k] - done[k])
+            boosts[k] = 1.0 + self.p.adapt_pool_strength * (deficit / max(1.0, tgt[k] if tgt[k] > 0 else 1.0))
+        return boosts
+
+    # ----- scoring -----
+
+    def _pair_score(self, t1: Team, t2: Team, want_gender: Optional[str]) -> Optional[float]:
+        # disjoint
+        s1, s2 = {t1.a.rank, t1.b.rank}, {t2.a.rank, t2.b.rank}
+        if s1 & s2: return None
+
+        # rank tolerance (per-pool)
+        tol = self._rank_tolerance_for(t1, t2)
+        if abs(t1.avg_rank - t2.avg_rank) > tol: return None
+
+        # teammate cap
+        pair1 = frozenset([t1.a.rank, t1.b.rank])
+        pair2 = frozenset([t2.a.rank, t2.b.rank])
+        if self.teammate_counts[pair1] >= self.teammate_cap: return None
+        if self.teammate_counts[pair2] >= self.teammate_cap: return None
+
+        # base score
+        score = 0.0
+
+        # fairness (adaptive per player)
+        for rk in list(s1) + list(s2):
+            boost = self._player_fair_boost(rk)
+            score -= self.p.w_fair * boost * self.games_played[rk]
+
+        # pool quota bonus (with adaptive multipliers)
+        def pool_bonus(a: Player, b: Player) -> float:
+            tag_a, tag_b = self.pool_tag[a.rank], self.pool_tag[b.rank]
+            tgt_a, done_a = self.pool_targets[a.rank], self.pool_counts[a.rank]
+            tgt_b, done_b = self.pool_targets[b.rank], self.pool_counts[b.rank]
+            mult_a = self._player_pool_boosts(a.rank)
+            mult_b = self._player_pool_boosts(b.rank)
+
+            def need(target: float, done: float) -> float:
+                return max(0.0, target - done)
+
+            val = 0.0
+            if tag_a == tag_b:
+                val += self.p.w_pool_quota * (mult_a["same"] * need(tgt_a["same"], done_a["same"])
+                                              + mult_b["same"] * need(tgt_b["same"], done_b["same"]))
+            else:
+                if tag_a == "A" or tag_b == "A":
+                    val += self.p.w_pool_quota * (mult_a["avg"] * need(tgt_a["avg"], done_a["avg"])
+                                                  + mult_b["avg"] * need(tgt_b["avg"], done_b["avg"]))
+                if tag_a == "G" and tag_b == "P":
+                    val += self.p.w_pool_quota * (mult_a["opp_p"] * need(tgt_a["opp_p"], done_a["opp_p"])
+                                                  + mult_b["opp_g"] * need(tgt_b["opp_g"], done_b["opp_g"]))
+                elif tag_a == "P" and tag_b == "G":
+                    val += self.p.w_pool_quota * (mult_a["opp_g"] * need(tgt_a["opp_g"], done_a["opp_g"])
+                                                  + mult_b["opp_p"] * need(tgt_b["opp_p"], done_b["opp_p"]))
+            return val
+
+        score += pool_bonus(t1.a, t1.b)
+        score += pool_bonus(t2.a, t2.b)
+
+        # couples 'with' bonus
+        for a, b in [(t1.a, t1.b), (t2.a, t2.b)]:
+            if a.rank in self.couple and self.couple[a.rank] == (b.rank, "with"): score += 4.0
+            if b.rank in self.couple and self.couple[b.rank] == (a.rank, "with"): score += 4.0
+
+        # variety: teammates (nonlinear)
+        rep1 = self.teammate_counts[pair1]
+        rep2 = self.teammate_counts[pair2]
+        score -= self.p.w_variety * (rep1 ** 2 + rep2 ** 2)
+
+        # opponent variety: penalize frequent opponent pairs
+        # four cross pairs: a vs c,d and b vs c,d
+        opp_pairs = [
+            frozenset([t1.a.rank, t2.a.rank]),
+            frozenset([t1.a.rank, t2.b.rank]),
+            frozenset([t1.b.rank, t2.a.rank]),
+            frozenset([t1.b.rank, t2.b.rank]),
+        ]
+        for op in opp_pairs:
+            score -= self.p.w_opp_variety * (self.opponent_counts[op] ** 1.5)
+
+        # gender soft bonus
+        if want_gender is not None:
+            if t1.gender == want_gender and t2.gender == want_gender:
+                score += self.p.w_gender_bonus
+
+        # de-dup slight penalty
+        mk = tuple(sorted([t1.key(), t2.key()]))
+        if mk in self.used_match_keys: score -= 2.0
+
+        return score
+
+    # ----- rolling-horizon selection -----
+
+    def _select_batch(self, avail: List[Player]) -> List[Match]:
+        """Pick up to self.horizon matches greedily by score, without overlap."""
+        want_gender = self._gender_preference(avail) if self.p.enforce_gender_priority else None
+        teams = self._gen_candidate_teams(avail)
+        # Precompute all pair scores
+        candidates: List[Tuple[float, Match]] = []
         for i in range(len(teams)):
             for j in range(i + 1, len(teams)):
                 t1, t2 = teams[i], teams[j]
-                s1, s2 = {t1.a.rank, t1.b.rank}, {t2.a.rank, t2.b.rank}
-                if s1 & s2:
-                    continue
-                if want_gender and (t1.gender != want_gender or t2.gender != want_gender):
-                    continue
-                if abs(t1.avg_rank - t2.avg_rank) > rank_tolerance:
-                    continue
-                # variety gate
-                if self._pair_blocked_by_variety(t1) or self._pair_blocked_by_variety(t2):
-                    continue
+                sc = self._pair_score(t1, t2, want_gender)
+                if sc is not None:
+                    candidates.append((sc, Match(t1, t2)))
+        # Sort best-first
+        candidates.sort(key=lambda x: x[0], reverse=True)
 
-                chosen = list(s1) + list(s2)
+        picked: List[Match] = []
+        used: Set[int] = set()
+        limit = self.horizon
+        # Simulated counters to avoid reusing players within this batch
+        temp_teammates = self.teammate_counts.copy()
+        temp_opponents = self.opponent_counts.copy()
+        temp_games = self.games_played.copy()
 
-                # pacing guard: avoid picking players too far ahead
-                if any(self.pace_ahead(rk, match_idx) > self.p.max_ahead_margin for rk in chosen):
-                    continue
+        for sc, m in candidates:
+            if len(picked) >= limit: break
+            ranks = [m.team1.a.rank, m.team1.b.rank, m.team2.a.rank, m.team2.b.rank]
+            if any(r in used for r in ranks): continue
+            # Commit into temp stats (light simulation)
+            p1 = frozenset([m.team1.a.rank, m.team1.b.rank])
+            p2 = frozenset([m.team2.a.rank, m.team2.b.rank])
+            # Enforce cap in temp as well
+            if temp_teammates[p1] >= self.teammate_cap: continue
+            if temp_teammates[p2] >= self.teammate_cap: continue
+            # OK pick it
+            picked.append(m)
+            used.update(ranks)
+            temp_teammates[p1] += 1
+            temp_teammates[p2] += 1
+            # Opponents
+            for op in [
+                frozenset([m.team1.a.rank, m.team2.a.rank]),
+                frozenset([m.team1.a.rank, m.team2.b.rank]),
+                frozenset([m.team1.b.rank, m.team2.a.rank]),
+                frozenset([m.team1.b.rank, m.team2.b.rank]),
+            ]:
+                temp_opponents[op] += 1
+            for rk in ranks:
+                temp_games[rk] += 1
 
-                score = 0.0
-                # pacing rewards (prefer behind pace)
-                for rk in chosen:
-                    ahead = self.pace_ahead(rk, match_idx)
-                    score += -10.0 * ahead  # stronger than before
-                # slight fairness backup
-                for rk in chosen:
-                    score -= 1.5 * self.games_played[rk]
+        return picked
 
-                # teammate repeat penalty (strong)
-                score -= 7.0 * self.teammate_counts[frozenset(s1)]
-                score -= 7.0 * self.teammate_counts[frozenset(s2)]
+    # ----- build PLAY ORDER -----
 
-                # couples 'with' bonus
-                for a, b in [(t1.a, t1.b), (t2.a, t2.b)]:
-                    if a.rank in self.couple and self.couple[a.rank] == (b.rank, "with"):
-                        score += 6.0
-                    if b.rank in self.couple and self.couple[b.rank] == (a.rank, "with"):
-                        score += 6.0
-
-                # intensity steering
-                score += self._intensity_bonus(intensity, chosen)
-
-                # teammate-pool steering
-                score += self._pool_bonus_for_pair(t1.a, t1.b)
-                score += self._pool_bonus_for_pair(t2.a, t2.b)
-
-                # avoid duplicate full matchups
-                mk = tuple(sorted([t1.key(), t2.key()]))
-                if mk in self.used_match_keys:
-                    score -= 2.0
-
-                m = Match(t1, t2, intensity=intensity)
-                if best is None or score > best[0]:
-                    best = (score, m)
-        return best[1] if best else None
-
-    # ---- fallback ----
-    def _fallback_match(self, avail: List[Player], intensity: str, match_idx: int) -> Optional['Match']:
-        if len(avail) < 4:
-            return None
-        cand = sorted(avail, key=lambda p: (self.games_played[p.rank], random.random()))[:8]
-        best = None
-        for a, b, c, d in combinations(cand, 4):
-            options = [
-                (Team(a, b), Team(c, d)),
-                (Team(a, c), Team(b, d)),
-                (Team(a, d), Team(b, c)),
-            ]
-            for t1, t2 in options:
-                chosen = [t1.a.rank, t1.b.rank, t2.a.rank, t2.b.rank]
-                if any(self.pace_ahead(rk, match_idx) > self.p.max_ahead_margin for rk in chosen):
-                    continue
-                if self._pair_blocked_by_variety(t1) or self._pair_blocked_by_variety(t2):
-                    continue
-                # forbid 'against' couples
-                bad = False
-                for x, y in [(t1.a, t1.b), (t2.a, t2.b)]:
-                    if x.rank in self.couple and self.couple[x.rank] == (y.rank, 'against'):
-                        bad = True; break
-                    if y.rank in self.couple and self.couple[y.rank] == (x.rank, 'against'):
-                        bad = True; break
-                if bad:
-                    continue
-                diff = abs(t1.avg_rank - t2.avg_rank)
-                rep = self.teammate_counts[frozenset([t1.a.rank, t1.b.rank])] + \
-                      self.teammate_counts[frozenset([t2.a.rank, t2.b.rank])]
-                score = -diff - 0.3 * rep
-                # pacing & intensity & pool steering
-                score += sum(-8.0 * self.pace_ahead(rk, match_idx) for rk in chosen)
-                score += self._intensity_bonus(intensity, chosen)
-                score += self._pool_bonus_for_pair(t1.a, t1.b)
-                score += self._pool_bonus_for_pair(t2.a, t2.b)
-                m = Match(t1, t2, intensity=intensity)
-                if best is None or score > best[0]:
-                    best = (score, m)
-        return best[1] if best else None
-
-    # ---- build play order ----
     def build_play_order(self) -> List[Match]:
         play_order: List[Match] = []
         m_idx = 0
+        # We'll append batch by batch; each match still is a single item in the queue.
         while m_idx < self.matches_total:
-            suggested_intensity = "close" if (m_idx % 4) != 3 else "diverse"
-
             avail = self._available_players_window()
             if len(avail) < 4:
-                self.dstats["stops_no_avail"] += 1
                 break
 
-            # gender desire
-            want_gender: Optional[str] = None
-            if self.p.enforce_gender_priority:
-                counts = {"m": sum(1 for p in avail if p.gender == "m"),
-                          "f": sum(1 for p in avail if p.gender == "f")}
-                def can_make(g: str) -> bool:
-                    if g == "mm": return counts["m"] >= 4
-                    if g == "mf": return counts["m"] >= 2 and counts["f"] >= 2
-                    if g == "ff": return counts["f"] >= 4
-                    return False
-                for g in ["mm", "mf", "ff"]:
-                    if can_make(g):
-                        want_gender = g
-                        break
-
-            tiers = [
-                (self.p.rank_tolerance,       want_gender, suggested_intensity),
-                (self.p.rank_tolerance,       None,        suggested_intensity),
-                (self.p.rank_tolerance + 1,   None,        suggested_intensity),
-                (self.p.rank_tolerance + 2,   None,        suggested_intensity),
-                (self.p.rank_tolerance + 1,   None,        ("diverse" if suggested_intensity=="close" else "close")),
-                (self.p.rank_tolerance + 3,   None,        "close"),
-            ]
-            match = None
-            for rank_tol, want_g, inten in tiers:
-                cand = self._gen_candidate_teams(avail, inten, want_g)
-                match = self._pair_teams(cand, rank_tol, want_g, inten, m_idx)
-                if match:
-                    match.intensity = inten
+            batch = self._select_batch(avail)
+            if not batch:
+                # try a looser pass by relaxing gender bonus (turn off)
+                batch = self._select_batch(avail)  # already used same; but want_gender can become None if enforce off
+                if not batch:
                     break
 
-            if not match:
-                match = self._fallback_match(avail, suggested_intensity, m_idx)
-                if not match:
-                    alt = "diverse" if suggested_intensity == "close" else "close"
-                    match = self._fallback_match(avail, alt, m_idx)
-                if match:
-                    self.dstats["fallback_used"] += 1
+            # Commit batch to real stats
+            for match in batch:
+                if m_idx >= self.matches_total:
+                    break
+                play_order.append(match)
+                self.used_match_keys.add(match.key())
 
-            if not match:
-                self.dstats["stops_no_match"] += 1
-                break
+                pair1 = frozenset([match.team1.a.rank, match.team1.b.rank])
+                pair2 = frozenset([match.team2.a.rank, match.team2.b.rank])
+                self.teammate_counts[pair1] += 1
+                self.teammate_counts[pair2] += 1
 
-            # commit
-            play_order.append(match)
-            self.used_match_keys.add(match.key())
+                # Opponents (four cross pairs)
+                for op in [
+                    frozenset([match.team1.a.rank, match.team2.a.rank]),
+                    frozenset([match.team1.a.rank, match.team2.b.rank]),
+                    frozenset([match.team1.b.rank, match.team2.a.rank]),
+                    frozenset([match.team1.b.rank, match.team2.b.rank]),
+                ]:
+                    self.opponent_counts[op] += 1
 
-            # update pair counts and recent cooldown list
-            pair1 = frozenset([match.team1.a.rank, match.team1.b.rank])
-            pair2 = frozenset([match.team2.a.rank, match.team2.b.rank])
-            self.teammate_counts[pair1] += 1
-            self.teammate_counts[pair2] += 1
-            self.recent_pairs.append(pair1)
-            self.recent_pairs.append(pair2)
-
-            # update per-player counts and pool tallies
-            for a, b in [(match.team1.a, match.team1.b), (match.team2.a, match.team2.b)]:
-                for rk in [a.rank, b.rank]:
+                ranks = [match.team1.a.rank, match.team1.b.rank, match.team2.a.rank, match.team2.b.rank]
+                for rk in ranks:
                     self.games_played[rk] += 1
-                    if match.intensity == "close":
-                        self.close_count[rk] += 1
-                    else:
-                        self.diverse_count[rk] += 1
-                ap, bp = pool_of_rank(a.rank), pool_of_rank(b.rank)
-                if bp == "G": self.with_G[a.rank] += 1
-                if bp == "A": self.with_A[a.rank] += 1
-                if bp == "P": self.with_P[a.rank] += 1
-                if ap == "G": self.with_G[b.rank] += 1
-                if ap == "A": self.with_A[b.rank] += 1
-                if ap == "P": self.with_P[b.rank] += 1
 
-            # advance sliding window (courts-1)
-            self.window.append([match.team1.a.rank, match.team1.b.rank,
-                                match.team2.a.rank, match.team2.b.rank])
-            m_idx += 1
+                # update pool counts (how we measure quotas)
+                def inc_counts(x: Player, y_tag: str):
+                    tgt = self.pool_counts[x.rank]
+                    x_tag = self.pool_tag[x.rank]
+                    if x_tag == y_tag:
+                        tgt["same"] += 1
+                    elif x_tag == "A" or y_tag == "A":
+                        tgt["avg"] += 1
+                        if x_tag == "G" and y_tag == "P": tgt["opp_p"] += 1
+                        if x_tag == "P" and y_tag == "G": tgt["opp_g"] += 1
+                    else:
+                        if x_tag == "G" and y_tag == "P": tgt["opp_p"] += 1
+                        if x_tag == "P" and y_tag == "G": tgt["opp_g"] += 1
+
+                inc_counts(match.team1.a, self.pool_tag[match.team1.b.rank])
+                inc_counts(match.team1.b, self.pool_tag[match.team1.a.rank])
+                inc_counts(match.team2.a, self.pool_tag[match.team2.b.rank])
+                inc_counts(match.team2.b, self.pool_tag[match.team2.a.rank])
+
+                # advance window (players in this single match)
+                self.window.append([match.team1.a.rank, match.team1.b.rank,
+                                    match.team2.a.rank, match.team2.b.rank])
+                m_idx += 1
 
         return play_order
 
-# ---------- Renderer & Debug ----------
+# ---------- Renderer ----------
 
 def render_play_order_md(cfg: SessionConfig, params: ScheduleParams, queue: List[Match]) -> str:
     lines: List[str] = []
     lines.append("# Play Order\n\n")
     lines.append(f"Courts: {cfg.court_no} | Session: {cfg.court_duration} min | Avg match: {params.average_match_minutes} min\n")
     lines.append(f"Sliding window: any {cfg.court_no} consecutive matches share no player\n")
-    lines.append(f"Rank tolerance: ±{params.rank_tolerance} | Intensity: 3 close : 1 diverse | Gender priority: {params.enforce_gender_priority}\n\n")
-    lines.append("| # | Intensity | Team 1 | Team 2 | Avg1 | Avg2 | Gender |\n")
-    lines.append("| -:|:---------:|--------|--------|-----:|-----:|--------|\n")
+    lines.append(
+        "Rank tolerance: ±{tol} (+{opp} for G↔P) | Pool mix: G/A 50/25/25, P 20/55/25 | Gender priority: {gp}\n\n"
+        .format(tol=params.rank_tolerance, opp=params.rank_tolerance_opp_extra, gp=params.enforce_gender_priority)
+    )
+    lines.append("| # | Team 1 | Team 2 | Avg1 | Avg2 | Gender |\n")
+    lines.append("| -:|--------|--------|-----:|-----:|--------|\n")
     for i, m in enumerate(queue, start=1):
         t1, t2 = m.team1, m.team2
         team1 = f"{t1.a.rank}-{t1.a.name} & {t1.b.rank}-{t1.b.name}"
         team2 = f"{t2.a.rank}-{t2.a.name} & {t2.b.rank}-{t2.b.name}"
-        lines.append(f"| {i} | {m.intensity} | {team1} | {team2} | {t1.avg_rank:.1f} | {t2.avg_rank:.1f} | {t1.gender} vs {t2.gender} |\n")
+        lines.append(f"| {i} | {team1} | {team2} | {t1.avg_rank:.1f} | {t2.avg_rank:.1f} | {t1.gender} vs {t2.gender} |\n")
     lines.append("\n")
     return "".join(lines)
 
-def print_debug_summary(cfg: SessionConfig, sched: 'Scheduler', queue: List['Match']) -> None:
-    print("---- DEBUG SUMMARY ----")
-    print(f"Matches generated: {len(queue)} / target {sched.matches_total}")
-    print(f"Target per player ≈ {sched.target_per_player:.2f} "
-          f"(close≈{sched.target_close}, diverse≈{sched.target_diverse})")
+# ---------- Debug summary ----------
 
-    # Per-player totals
-    print("\nPer-player totals (rank name: games | close/diverse | pace_ahead):")
+def print_debug_summary(cfg: SessionConfig, sched: 'Scheduler', queue: List['Match']):
+    print("\n=== DEBUG SUMMARY ===")
+    print(f"Courts: {cfg.court_no}, Session: {cfg.court_duration} min, Avg match: {sched.p.average_match_minutes} min")
+    print(f"Matches generated: {len(queue)} (target {sched.matches_total})")
+    print(f"Target per player ≈ {sched.target_per_player:.2f}")
+
+    print("\nGames per player:")
     for p in sorted(cfg.players, key=lambda x: x.rank):
-        gp = sched.games_played[p.rank]
-        c = sched.close_count[p.rank]; d = sched.diverse_count[p.rank]
-        pace_ahead = gp - sched.target_per_player
-        print(f"  {p.rank:>2} {p.name:<12}: {gp:>2} | {c}/{d} | {pace_ahead:+.2f}")
+        print(f"  {p.rank:2d} {p.name:12s}: {sched.games_played[p.rank]:2d}")
+
+    print("\nPool mix (Same/Avg/Opp) vs targets:")
+    for p in sorted(cfg.players, key=lambda x: x.rank):
+        tag = sched.pool_tag[p.rank]
+        tgt = sched.pool_targets[p.rank]
+        cnt = sched.pool_counts[p.rank]
+        opp_target = tgt["opp_g"] + tgt["opp_p"]
+        opp_done   = cnt["opp_g"] + cnt["opp_p"]
+        print(f"  {p.rank:2d} {p.name:12s} [{tag}] : "
+              f"same {int(cnt['same'])}/{int(round(tgt['same']))}, "
+              f"avg {int(cnt['avg'])}/{int(round(tgt['avg']))}, "
+              f"opp {int(opp_done)}/{int(round(opp_target))}")
 
     # Top repeated teammate pairs
-    repeats = [(pair, cnt) for pair, cnt in sched.teammate_counts.items() if cnt > 1]
-    repeats.sort(key=lambda x: -x[1])
-    if repeats:
-        print("\nTop repeated teammate pairs:")
-        for pair, cnt in repeats[:12]:
+    repeats_tm = [(pair, c) for pair, c in sched.teammate_counts.items() if c > 1]
+    if repeats_tm:
+        print("\nRepeated teammate pairs (top):")
+        for pair, c in sorted(repeats_tm, key=lambda kv: -kv[1])[:10]:
             a, b = sorted(list(pair))
-            pa = next(pp for pp in cfg.players if pp.rank == a)
-            pb = next(pp for pp in cfg.players if pp.rank == b)
-            print(f"  {a}-{pa.name} & {b}-{pb.name}: {cnt}x")
+            print(f"  {a}-{sched.players_by_rank[a].name} & {b}-{sched.players_by_rank[b].name}: {c}x")
+    else:
+        print("\nRepeated teammate pairs: none")
 
-    # Pool mix per player (teammates’ pools G/A/P)
-    print("\nPool mix (G/A/P teammates) per player:")
-    for p in sorted(cfg.players, key=lambda x: x.rank):
-        tot = max(1, sched.games_played[p.rank])
-        g = sched.with_G[p.rank]; a = sched.with_A[p.rank]; pr = sched.with_P[p.rank]
-        print(f"  {p.rank:>2} {p.name:<12}: G {g}/{tot}, A {a}/{tot}, P {pr}/{tot}")
+    # Top repeated opponent pairs
+    repeats_op = [(pair, c) for pair, c in sched.opponent_counts.items() if c > 1]
+    if repeats_op:
+        print("\nRepeated opponent pairs (top):")
+        for pair, c in sorted(repeats_op, key=lambda kv: -kv[1])[:10]:
+            a, b = sorted(list(pair))
+            print(f"  {a}-{sched.players_by_rank[a].name} vs {b}-{sched.players_by_rank[b].name}: {c}x")
+    else:
+        print("\nRepeated opponent pairs: none")
 
 # ---------- CLI ----------
 
 def main():
-    ap = argparse.ArgumentParser(description="Badminton matchmaking – scheduler (play-order)")
+    ap = argparse.ArgumentParser(description="Badminton matchmaking – scheduler (upgraded)")
     ap.add_argument("--input", required=True, help="players.json or players.md from app.py")
     ap.add_argument("--output-md", help="write play order to this Markdown file")
-    ap.add_argument("--avg", type=int, default=10, help="average match minutes (8–12 typical)")
-    ap.add_argument("--rank-tol", type=int, default=1, help="max diff between team average ranks")
-    ap.add_argument("--close-delta", type=int, default=2, help="teammates close if |r1-r2| <= this")
-    ap.add_argument("--far-threshold", type=int, default=3, help="teammates diverse if |r1-r2| > this")
-    ap.add_argument("--no-gender-priority", action="store_true", help="disable mm/mf/ff preference")
-    ap.add_argument("--seed", type=int, default=42, help="random seed")
-    ap.add_argument("--debug", action="store_true", help="print debug summaries")
 
     # knobs
-    ap.add_argument("--teammate-cap", type=int, default=None, help="hard cap of times the same pair can team")
-    ap.add_argument("--teammate-cap-ratio", type=float, default=0.25, help="fraction of a player's games with the same teammate (default 0.25)")
-    ap.add_argument("--teammate-cooldown", type=int, default=None, help="cooldown in games before the same pair can team again (default courts*3)")
-    ap.add_argument("--max-ahead-margin", type=float, default=0.5, help="max games ahead of pace allowed to be scheduled (default 0.5)")
-    ap.add_argument("--pool-mix-boost", type=float, default=1.0, help="increase positive pool-mix nudges")
-    ap.add_argument("--pool-mix-penalty", type=float, default=1.0, help="increase penalties when pool-mix is off")
+    ap.add_argument("--avg", type=int, default=10)
+    ap.add_argument("--rank-tol", type=int, default=1)
+    ap.add_argument("--rank-tol-opp-extra", type=int, default=1)
+    ap.add_argument("--no-gender-priority", action="store_true")
+    ap.add_argument("--seed", type=int, default=42)
+
+    # weights / cap
+    ap.add_argument("--w-pool", type=float, default=15.0)
+    ap.add_argument("--w-variety", type=float, default=12.0)
+    ap.add_argument("--w-opp-variety", type=float, default=6.0)
+    ap.add_argument("--w-fair", type=float, default=8.0)
+    ap.add_argument("--w-gender", type=float, default=2.0)
+    ap.add_argument("--cap", type=int, default=-1)  # -1 = use ratio rule
+    ap.add_argument("--cap-ratio", type=float, default=0.25)
+
+    # pool split
+    ap.add_argument("--pool-split", type=str, default="0.25,0.45,0.30")
+
+    # per-pool ratios
+    ap.add_argument("--ratio-G", type=str, default="0.50,0.25,0.25")
+    ap.add_argument("--ratio-A", type=str, default="0.50,0.25,0.25")
+    ap.add_argument("--ratio-P", type=str, default="0.20,0.55,0.25")
+    ap.add_argument("--avg-opp-split", type=float, default=0.5)
+
+    # adaptive
+    ap.add_argument("--no-adapt", action="store_true")
+    ap.add_argument("--adapt-pool", type=float, default=0.5)
+    ap.add_argument("--adapt-fair", type=float, default=0.35)
+    ap.add_argument("--adapt-thresh", type=float, default=1.0)
+
+    # horizon
+    ap.add_argument("--horizon", type=int, default=-1)
 
     args = ap.parse_args()
+
+    g,a,p = [float(x) for x in args.pool_split.split(",")]
+    rsG, raG, roG = [float(x) for x in args.ratio_G.split(",")]
+    rsA, raA, roA = [float(x) for x in args.ratio_A.split(",")]
+    rsP, raP, roP = [float(x) for x in args.ratio_P.split(",")]
 
     cfg = load_config(args.input)
     params = ScheduleParams(
         average_match_minutes=args.avg,
         rank_tolerance=args.rank_tol,
-        teammate_close_delta=args.close_delta,
-        teammate_far_threshold=args.far_threshold,
+        rank_tolerance_opp_extra=args.rank_tol_opp_extra,
         enforce_gender_priority=not args.no_gender_priority,
         random_seed=args.seed,
-        max_ahead_margin=args.max_ahead_margin,
-        teammate_cap_ratio=args.teammate_cap_ratio,
-        teammate_cap_override=args.teammate_cap,
-        teammate_cooldown_games=args.teammate_cooldown,
-        pool_mix_boost=args.pool_mix_boost,
-        pool_mix_penalty=args.pool_mix_penalty,
+
+        pool_split_g=g, pool_split_a=a, pool_split_p=p,
+
+        ratio_same_G=rsG, ratio_avg_G=raG, ratio_opp_G=roG,
+        ratio_same_A=rsA, ratio_avg_A=raA, ratio_opp_A=roA,
+        ratio_same_P=rsP, ratio_avg_P=raP, ratio_opp_P=roP,
+        avg_opp_split=args.avg_opp_split,
+
+        w_pool_quota=args.w_pool, w_variety=args.w_variety, w_opp_variety=args.w_opp_variety,
+        w_fair=args.w_fair, w_gender_bonus=args.w_gender,
+        teammate_cap_override=(None if args.cap < 0 else args.cap),
+        teammate_cap_ratio=args.cap_ratio,
+
+        adaptive_on=not args.no_adapt,
+        adapt_pool_strength=args.adapt_pool,
+        adapt_fair_strength=args.adapt_fair,
+        adapt_games_threshold=args.adapt_thresh,
+
+        horizon_matches=(None if args.horizon < 0 else args.horizon),
     )
 
-    sched = Scheduler(cfg, params, debug=args.debug)
+    sched = Scheduler(cfg, params)
     queue = sched.build_play_order()
     md = render_play_order_md(cfg, params, queue)
     print(md)
@@ -607,8 +672,7 @@ def main():
             f.write(md)
         print(f"\nSaved: {os.path.abspath(args.output_md)}")
 
-    if args.debug:
-        print_debug_summary(cfg, sched, queue)
+    print_debug_summary(cfg, sched, queue)
 
 if __name__ == "__main__":
     main()

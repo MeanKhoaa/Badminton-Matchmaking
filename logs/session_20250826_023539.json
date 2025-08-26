@@ -1,7 +1,16 @@
 {
+  "timestamp": "20250826_023539",
   "court_no": 3,
   "court_duration": 120,
-  "player_amount": 16,
+  "average_match_minutes": 10,
+  "rank_tolerance": 2,
+  "teammate_cap": 2,
+  "teammate_cap_ratio": 0.25,
+  "teammate_cooldown_games": null,
+  "max_ahead_margin": 0.5,
+  "pool_mix_boost": 1.0,
+  "pool_mix_penalty": 1.0,
+  "players_count": 16,
   "players": [
     {
       "rank": 1,
@@ -114,6 +123,46 @@
       "gender": "m",
       "paired_with_rank": null,
       "pairing_pref": null
+    }
+  ],
+  "games_generated": 36,
+  "games_recorded": 1,
+  "matches": [
+    {
+      "index": 1,
+      "intensity": "close",
+      "team1": {
+        "team": [
+          {
+            "rank": 1,
+            "name": "Khuong",
+            "gender": "m"
+          },
+          {
+            "rank": 3,
+            "name": "Ha",
+            "gender": "m"
+          }
+        ],
+        "avg_rank": 2.0,
+        "gender": "mm"
+      },
+      "team2": {
+        "team": [
+          {
+            "rank": 2,
+            "name": "Vinh",
+            "gender": "m"
+          },
+          {
+            "rank": 4,
+            "name": "Nam",
+            "gender": "m"
+          }
+        ],
+        "avg_rank": 3.0,
+        "gender": "mm"
+      }
     }
   ]
 }
