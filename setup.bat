@@ -1,43 +1,29 @@
 @echo off
-title Badminton Matchmaking - Setup & Run
+REM ================================================
+REM Build both EXE files for Badminton Matchmaking
+REM Requires: Python + pip + pyinstaller installed
+REM ================================================
 
-REM --- Check Python ---
-where python >nul 2>nul
-if %ERRORLEVEL% NEQ 0 (
-  where python3 >nul 2>nul
-  if %ERRORLEVEL% NEQ 0 (
-    echo.
-    echo Python is not installed.
-    echo Please install Python 3.10+ from https://www.python.org/downloads/
-    echo Make sure to check "Add Python to PATH" during install.
-    pause
-    exit /b 1
-  ) else (
-    set "PY=python3"
-  )
-) else (
-  set "PY=python"
+echo Cleaning old builds...
+rmdir /s /q build dist
+del /q *.spec
+
+echo Installing PyInstaller if missing...
+pip show pyinstaller >nul 2>&1
+IF %ERRORLEVEL% NEQ 0 (
+    pip install pyinstaller
 )
 
-echo Python found: %PY%
-echo.
+echo Building BadmintonSetup.exe (player recorder)...
+pyinstaller --onefile --clean --noconfirm --name BadmintonSetup app.py
 
-REM --- Move to script directory (repo root) ---
-cd /d "%~dp0"
+echo Building BadmintonSession.exe (session scheduler)...
+pyinstaller --onefile --clean --noconfirm --name BadmintonSession session_ui.py
 
-REM --- Create outputs/logs folders (if missing) ---
-if not exist outputs mkdir outputs
-if not exist logs mkdir logs
+echo ================================================
+echo Done! Check the dist\ folder for:
+echo   BadmintonSetup.exe
+echo   BadmintonSession.exe
+echo ================================================
 
-REM --- Run session UI ---
-%PY% session_ui.py
-if %ERRORLEVEL% NEQ 0 (
-  echo.
-  echo Something went wrong running session_ui.py
-  pause
-  exit /b 1
-)
-
-echo.
-echo Done.
 pause

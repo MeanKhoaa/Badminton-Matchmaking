@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Badminton Matchmaking – Session UI (Upgraded)
+Badminton Matchmaking – Session UI (Fixed Horizon + Auto-Relax)
 
 - Reads players.json/md (from app.py)
-- Interactive prompts for ALL key knobs used by scheduler.py
-- Builds full play order and saves to outputs/play_order_<timestamp>.md
-- Optional --debug prints the detailed debug summary
+- Prompts for key knobs used by scheduler.py
+- Scheduler now:
+  * uses FIXED rolling horizon = court_no
+  * auto-relaxes constraints stepwise if no batch can be found
+  * strictly prevents double-booking via sliding window
 
 Run:
   python session_ui.py --input players.json --debug
@@ -56,6 +58,7 @@ def run_session(input_path: str, debug_flag: bool = False):
 
     print("\n=== Session Setup ===")
     print(f"Courts: {cfg.court_no}, Duration: {cfg.court_duration} min, Players: {cfg.player_amount}")
+    print("Note: Scheduler uses fixed rolling horizon = number of courts and auto-relaxes if needed.\n")
 
     # Core timing / fairness
     avg_match = _prompt_int("Average minutes per match", 10)
@@ -63,7 +66,7 @@ def run_session(input_path: str, debug_flag: bool = False):
     rank_tol_opp_extra = _prompt_int("Extra tolerance for G<->P matches", 1)
     seed = _prompt_int("Random seed", 42)
 
-    # Gender priority
+    # Gender priority (soft bonus)
     gender_priority = _prompt_yesno("Enforce gender priority (soft bonus)", True)
 
     # Pool split (how players are classified into G/A/P by rank percentiles)
@@ -91,19 +94,14 @@ def run_session(input_path: str, debug_flag: bool = False):
         cap_override = _prompt_int("Teammate cap (number)", 3)
     cap_ratio = _prompt_float("Teammate cap ratio (if no explicit cap, cap = ceil(target_per_player * ratio))", 0.25)
 
-    # Adaptive
+    # Adaptive (recommended ON)
     print("\n--- Adaptive Catch-up (recommended ON) ---")
     adaptive_on = _prompt_yesno("Enable adaptive weights", True)
     adapt_pool = _prompt_float("Adaptive strength: pool quotas (0..1)", 0.5)
     adapt_fair = _prompt_float("Adaptive strength: fairness (0..1)", 0.35)
     adapt_thresh = _prompt_float("Adaptive games-deficit threshold before boosting", 1.0)
 
-    # Rolling horizon
-    print("\n--- Rolling Horizon ---")
-    use_horizon = _prompt_yesno("Pick multiple matches per step (rolling horizon)?", True)
-    horizon = _prompt_int("Horizon size (number of matches per step, usually = court_no)", cfg.court_no) if use_horizon else -1
-
-    # Build params
+    # Build params (no horizon knob here; it’s fixed inside scheduler)
     params = ScheduleParams(
         average_match_minutes=avg_match,
         rank_tolerance=rank_tol,
@@ -131,8 +129,6 @@ def run_session(input_path: str, debug_flag: bool = False):
         adapt_pool_strength=adapt_pool,
         adapt_fair_strength=adapt_fair,
         adapt_games_threshold=adapt_thresh,
-
-        horizon_matches=(None if horizon < 0 else horizon),
     )
 
     # Schedule
@@ -150,13 +146,13 @@ def run_session(input_path: str, debug_flag: bool = False):
         f.write(md)
     print(f"Saved: {os.path.abspath(outpath)}")
 
-    # Debug
+    # Debug summary
     if debug_flag:
         print_debug_summary(cfg, sched, play_order)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Badminton matchmaking – session UI (upgraded)")
+    ap = argparse.ArgumentParser(description="Badminton matchmaking – session UI (fixed horizon, auto-relax)")
     ap.add_argument("--input", default="players.json", help="players.json or players.md")
     ap.add_argument("--debug", action="store_true", help="print detailed debug summary")
     args = ap.parse_args()

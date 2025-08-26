@@ -1,26 +1,27 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# ================================================
+# Build both executables for Badminton Matchmaking (Linux)
+# Requires: Python 3 + pip + pyinstaller installed
+# ================================================
 
-# cd to repo root (this script's folder)
-cd "$(dirname "$0")"
+set -e
 
-# pick python command
-if command -v python3 >/dev/null 2>&1; then
-  PY=python3
-elif command -v python >/dev/null 2>&1; then
-  PY=python
-else
-  cat <<'EOF'
-Python is not installed.
-Please install Python 3.10+ from https://www.python.org/downloads/
-(On macOS you can also: brew install python)
-EOF
-  exit 1
+echo "Cleaning old builds..."
+rm -rf build dist *.spec
+
+echo "Installing PyInstaller if missing..."
+if ! pip3 show pyinstaller > /dev/null 2>&1; then
+    pip3 install pyinstaller
 fi
-echo "Python found: $($PY --version)"
 
-# create output dirs
-mkdir -p outputs logs
+echo "Building BadmintonSetup-linux (player recorder)..."
+pyinstaller --onefile --clean --noconfirm --name BadmintonSetup-linux app.py
 
-# run
-exec "$PY" session_ui.py
+echo "Building BadmintonSession-linux (session scheduler)..."
+pyinstaller --onefile --clean --noconfirm --name BadmintonSession-linux session_ui.py
+
+echo "================================"
+echo "Done! Check the dist/ folder for:"
+echo "  BadmintonSetup-linux"
+echo "  BadmintonSession-linux"
+echo "================================"
