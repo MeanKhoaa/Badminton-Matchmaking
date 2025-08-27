@@ -124,7 +124,7 @@ def apply_log_to_scheduler(sched: Scheduler, past: List[Dict[str, Any]]):
 def render_and_save(queue, cfg: SessionConfig, params: ScheduleParams) -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_md = OUTPUT_DIR / f"play_order_{ts}.md"
-    md = scheduler.render_play_order_md(cfg, params, queue)  # already without Gender column
+    md = scheduler.render_play_order_md(cfg, params, queue)  # output omits gender and rank numbers
     with out_md.open("w", encoding="utf-8") as f:
         f.write(md)
     print(md)

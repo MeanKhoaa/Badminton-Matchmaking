@@ -708,15 +708,15 @@ def render_play_order_md(cfg: SessionConfig, params: ScheduleParams, queue: List
                  f"Pool-mix: G/A 50/25/25, P 20/55/25 (HARD in-round) | "
                  f"Teammate cap≈hard\n\n")
 
-    # Removed Gender column
-    lines.append("| # | Team 1 | Team 2 | Avg1 | Avg2 |\n")
-    lines.append("| -:|--------|--------|-----:|-----:|\n")
+    # Omit gender and rank numbers in output table
+    lines.append("| # | Team 1 | Team 2 |\n")
+    lines.append("| -:|--------|--------|\n")
 
     for i, m in enumerate(queue, start=1):
         t1, t2 = m.team1, m.team2
-        team1 = f"{t1.a.rank}-{t1.a.name} & {t1.b.rank}-{t1.b.name}"
-        team2 = f"{t2.a.rank}-{t2.a.name} & {t2.b.rank}-{t2.b.name}"
-        lines.append(f"| {i} | {team1} | {team2} | {t1.avg_rank:.1f} | {t2.avg_rank:.1f} |\n")
+        team1 = f"{t1.a.name} & {t1.b.name}"
+        team2 = f"{t2.a.name} & {t2.b.name}"
+        lines.append(f"| {i} | {team1} | {team2} |\n")
 
     lines.append("\n")
     return "".join(lines)
