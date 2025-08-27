@@ -18,11 +18,10 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
-import os
 import re
 import sys
-from glob import glob
-from typing import List, Optional, Dict
+from pathlib import Path
+from typing import List, Optional
 
 
 # ---------------------- Data models ----------------------
@@ -128,22 +127,18 @@ def collect_players(player_amount: int) -> List[Player]:
 
 # ---------------------- Reset helpers ----------------------
 
-def delete_old_player_artifacts():
-    """
-    Remove any players*.json and players*.md that live in the repo ROOT (current dir).
-    Does NOT touch files inside outputs/ or logs/.
-    """
-    patterns = ["players*.json", "players*.md"]
+def delete_old_player_artifacts() -> None:
+    """Remove any players*.json and players*.md in the repo root."""
+    patterns = ("players*.json", "players*.md")
     removed: list[str] = []
     for pat in patterns:
-        for path in glob(pat):
-            # Skip subdirectories just in case
-            if os.path.isdir(path):
+        for path in Path('.').glob(pat):
+            if path.is_dir():
                 continue
             try:
-                os.remove(path)
-                removed.append(path)
-            except Exception as e:
+                path.unlink()
+                removed.append(str(path))
+            except OSError as e:
                 print(f"  Warning: could not delete {path}: {e}")
     if removed:
         print("Reset: removed old player files -> " + ", ".join(sorted(removed)))
@@ -181,21 +176,21 @@ def main():
     )
 
     # Always write to players.md / players.json at repo root (overwrite)
-    md_path = "players.md"
-    json_path = "players.json"
+    md_path = Path("players.md")
+    json_path = Path("players.json")
 
-    with open(md_path, "w", encoding="utf-8") as f:
+    with md_path.open("w", encoding="utf-8") as f:
         f.write(to_markdown(cfg))
-    print(f"Saved: {os.path.abspath(md_path)}")
+    print(f"Saved: {md_path.resolve()}")
 
-    with open(json_path, "w", encoding="utf-8") as f:
+    with json_path.open("w", encoding="utf-8") as f:
         json.dump({
             "court_no": cfg.court_no,
             "court_duration": cfg.court_duration,
             "player_amount": cfg.player_amount,
             "players": [dataclasses.asdict(p) for p in cfg.players],
         }, f, indent=2)
-    print(f"Also wrote JSON to: {os.path.abspath(json_path)}")
+    print(f"Also wrote JSON to: {json_path.resolve()}")
 
     print("\nNext step: run 'python session_ui.py' to generate the play order.\n")
 

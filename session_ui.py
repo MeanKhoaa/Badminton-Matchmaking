@@ -10,36 +10,39 @@ Session UI (v3.1)
 """
 
 import json
-import os
 import sys
+import logging
 from datetime import datetime
+from pathlib import Path
 from typing import List, Dict, Any
 
 # Import local scheduler
 import scheduler
 from scheduler import SessionConfig, ScheduleParams, Scheduler
 
-PLAYERS_JSON = "players.json"
-OUTPUT_DIR = "outputs"
-LOG_JSON = os.path.join(OUTPUT_DIR, "session_log.json")       # append-only JSONL
-LAST_PLAYERS_SNAPSHOT = os.path.join(OUTPUT_DIR, "players_snapshot.json")
+logger = logging.getLogger(__name__)
+
+PLAYERS_JSON = Path("players.json")
+OUTPUT_DIR = Path("outputs")
+LOG_JSON = OUTPUT_DIR / "session_log.json"       # append-only JSONL
+LAST_PLAYERS_SNAPSHOT = OUTPUT_DIR / "players_snapshot.json"
 
 # ---------- Utilities ----------
 
-def ensure_outputs_dir():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+def ensure_outputs_dir() -> None:
+    OUTPUT_DIR.mkdir(exist_ok=True)
 
-def load_players_json(path: str) -> SessionConfig:
-    if not os.path.exists(path):
-        print(f"[ERROR] {path} not found. Run app.py first.")
+def load_players_json(path: Path) -> SessionConfig:
+    if not path.exists():
+        logger.error(f"{path} not found. Run app.py first.")
         sys.exit(1)
     return scheduler.load_config(path)
 
-def same_player_roster(cfg: SessionConfig, snapshot_path: str) -> bool:
-    if not os.path.exists(snapshot_path):
+def same_player_roster(cfg: SessionConfig, snapshot_path: Path) -> bool:
+    if not snapshot_path.exists():
         return False
     try:
-        with open(snapshot_path, "r", encoding="utf-8") as f:
+        with snapshot_path.open("r", encoding="utf-8") as f:
             snap = json.load(f)
         cur = [{"rank": p.rank, "name": p.name, "gender": p.gender} for p in cfg.players]
         return (snap.get("players") == cur
@@ -48,21 +51,21 @@ def same_player_roster(cfg: SessionConfig, snapshot_path: str) -> bool:
     except Exception:
         return False
 
-def save_players_snapshot(cfg: SessionConfig, snapshot_path: str):
+def save_players_snapshot(cfg: SessionConfig, snapshot_path: Path) -> None:
     data = {
         "court_no": cfg.court_no,
         "player_amount": cfg.player_amount,
         "players": [{"rank": p.rank, "name": p.name, "gender": p.gender} for p in cfg.players],
         "saved_at": datetime.now().isoformat(timespec="seconds"),
     }
-    with open(snapshot_path, "w", encoding="utf-8") as f:
+    with snapshot_path.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
-def parse_log_matches(log_path: str) -> List[Dict[str, Any]]:
+def parse_log_matches(log_path: Path) -> List[Dict[str, Any]]:
     matches = []
-    if not os.path.exists(log_path):
+    if not log_path.exists():
         return matches
-    with open(log_path, "r", encoding="utf-8") as f:
+    with log_path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -118,18 +121,20 @@ def apply_log_to_scheduler(sched: Scheduler, past: List[Dict[str, Any]]):
             sched.mix_counts[c.rank][sched._mix_bucket(c, d)] += 1
             sched.mix_counts[d.rank][sched._mix_bucket(d, c)] += 1
 
-def render_and_save(queue, cfg: SessionConfig, params: ScheduleParams) -> str:
+def render_and_save(queue, cfg: SessionConfig, params: ScheduleParams, debug: bool) -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_md = os.path.join(OUTPUT_DIR, f"play_order_{ts}.md")
-    md = scheduler.render_play_order_md(cfg, params, queue)  # already without Gender column
-    with open(out_md, "w", encoding="utf-8") as f:
+    out_md = OUTPUT_DIR / f"play_order_{ts}.md"
+    md = scheduler.render_play_order_md(
+        cfg, params, queue, debug=debug
+    )  # output omits gender unless debug mode shows ranks
+    with out_md.open("w", encoding="utf-8") as f:
         f.write(md)
     print(md)
-    print(f"Saved: {os.path.abspath(out_md)}")
+    logger.info(f"Saved: {out_md.resolve()}")
     return out_md
 
-def append_log(matches, upto_idx: int):
-    with open(LOG_JSON, "a", encoding="utf-8") as f:
+def append_log(matches, upto_idx: int) -> None:
+    with LOG_JSON.open("a", encoding="utf-8") as f:
         for i, m in enumerate(matches, start=1):
             if i > upto_idx:
                 break
@@ -163,6 +168,9 @@ def main():
         seed = 42
     debug = (input("Debug mode? [y/N]: ").strip().lower() == "y")
 
+    logging.basicConfig(level=logging.DEBUG if debug else logging.INFO,
+                        format="%(message)s")
+
     params = ScheduleParams(
         average_match_minutes=avg,
         rank_tolerance=1,
@@ -174,19 +182,19 @@ def main():
 
     # Resume logic: only if roster unchanged AND user opts-in
     resume_ok = same_player_roster(cfg, LAST_PLAYERS_SNAPSHOT)
-    if resume_ok and os.path.exists(LOG_JSON):
+    if resume_ok and LOG_JSON.exists():
         yn = input("Resume from previous session log? [Y/n]: ").strip().lower()
         if yn not in ("", "y", "yes"):
             try:
-                os.remove(LOG_JSON)
+                LOG_JSON.unlink()
             except Exception:
                 pass
     else:
         # roster changed; reset log automatically
-        if os.path.exists(LOG_JSON):
-            print("[INFO] Player base changed or no snapshot — clearing old session log.")
+        if LOG_JSON.exists():
+            logger.info("Player base changed or no snapshot — clearing old session log.")
             try:
-                os.remove(LOG_JSON)
+                LOG_JSON.unlink()
             except Exception:
                 pass
 
@@ -202,16 +210,15 @@ def main():
         past_matches = parse_log_matches(LOG_JSON)
         if past_matches:
             apply_log_to_scheduler(sched, past_matches)
-            if debug:
-                print(f"[DEBUG] Warmed scheduler with {len(past_matches)} past matches from log.")
+            logger.debug(f"Warmed scheduler with {len(past_matches)} past matches from log.")
 
         queue = sched.build_play_order()
         if not queue:
-            print("[WARN] No matches could be scheduled. Try changing roster or knobs.")
+            logger.warning("No matches could be scheduled. Try changing roster or knobs.")
             break
 
         print(f"\n>>> Running scheduler... (block {block_no})\n")
-        out_md = render_and_save(queue, cfg, params)
+        out_md = render_and_save(queue, cfg, params, debug)
 
         # End / continue controls
         print("\n=== End of Block ===")
@@ -229,9 +236,9 @@ def main():
 
         if upto > 0:
             append_log(queue, upto)
-            print(f"Recorded matches 1..{upto} (block {block_no}) to: {os.path.abspath(LOG_JSON)}")
+            logger.info(f"Recorded matches 1..{upto} (block {block_no}) to: {LOG_JSON.resolve()}")
         else:
-            print("No matches recorded from this block.")
+            logger.info("No matches recorded from this block.")
 
         if debug:
             print()

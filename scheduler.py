@@ -27,6 +27,7 @@ import os
 import random
 import re
 from collections import defaultdict, deque
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
 
 # --------------------------------------------------------------------------- #
@@ -61,25 +62,28 @@ class ScheduleParams:
 # Load config (JSON/MD from app.py)
 # --------------------------------------------------------------------------- #
 
-def load_config(path: str) -> SessionConfig:
-    if path.endswith(".json"):
-        with open(path, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        players = [Player(**p) for p in d["players"]]
-        players.sort(key=lambda p: p.rank)
-        return SessionConfig(
-            court_no=int(d["court_no"]),
-            court_duration=int(d["court_duration"]),
-            player_amount=int(d["player_amount"]),
-            players=players,
-        )
-    elif path.endswith(".md"):
-        return _load_md_minimal(path)
-    else:
-        raise ValueError("Provide a .json or .md produced by app.py")
+def load_config(path: str | Path) -> SessionConfig:
+    path = Path(path)
+    if path.suffix.lower() == ".json":
+        return _load_json_config(path)
+    if path.suffix.lower() == ".md":
+        return _load_md_config(path)
+    raise ValueError("Provide a .json or .md produced by app.py")
 
-def _load_md_minimal(path: str) -> SessionConfig:
-    with open(path, "r", encoding="utf-8") as f:
+def _load_json_config(path: Path) -> SessionConfig:
+    with path.open("r", encoding="utf-8") as f:
+        d = json.load(f)
+    players = [Player(**p) for p in d["players"]]
+    players.sort(key=lambda p: p.rank)
+    return SessionConfig(
+        court_no=int(d["court_no"]),
+        court_duration=int(d["court_duration"]),
+        player_amount=int(d["player_amount"]),
+        players=players,
+    )
+
+def _load_md_config(path: Path) -> SessionConfig:
+    with path.open("r", encoding="utf-8") as f:
         lines = f.readlines()
     kv: Dict[str, int] = {}
     for line in lines:
@@ -693,26 +697,38 @@ class Scheduler:
 # Render & Debug
 # --------------------------------------------------------------------------- #
 
-def render_play_order_md(cfg: SessionConfig, params: ScheduleParams, queue: List[Match]) -> str:
+def render_play_order_md(
+    cfg: SessionConfig, params: ScheduleParams, queue: List[Match], *, debug: bool = False
+) -> str:
     lines: List[str] = []
     lines.append("# Play Order\n\n")
-    lines.append(f"Courts: {cfg.court_no} | Session: {cfg.court_duration} min | "
-                 f"Avg match: {params.average_match_minutes} min\n")
-    lines.append(f"Sliding window: any {cfg.court_no} consecutive matches share no player (HARD)\n")
-    lines.append(f"Rank tol(auto): base ±{params.rank_tolerance} "
-                 f"(+{params.rank_tolerance_opp_extra}) | "
-                 f"Pool-mix: G/A 50/25/25, P 20/55/25 (HARD in-round) | "
-                 f"Teammate cap≈hard\n\n")
+    lines.append(
+        f"Courts: {cfg.court_no} | Session: {cfg.court_duration} min | "
+        f"Avg match: {params.average_match_minutes} min\n"
+    )
+    lines.append(
+        f"Sliding window: any {cfg.court_no} consecutive matches share no player (HARD)\n"
+    )
+    lines.append(
+        f"Rank tol(auto): base ±{params.rank_tolerance} "
+        f"(+{params.rank_tolerance_opp_extra}) | "
+        f"Pool-mix: G/A 50/25/25, P 20/55/25 (HARD in-round) | "
+        f"Teammate cap≈hard\n\n"
+    )
 
-    # Removed Gender column
-    lines.append("| # | Team 1 | Team 2 | Avg1 | Avg2 |\n")
-    lines.append("| -:|--------|--------|-----:|-----:|\n")
+    # Omit gender in table; include rank numbers only in debug mode
+    lines.append("| # | Team 1 | Team 2 |\n")
+    lines.append("| -:|--------|--------|\n")
 
     for i, m in enumerate(queue, start=1):
         t1, t2 = m.team1, m.team2
-        team1 = f"{t1.a.rank}-{t1.a.name} & {t1.b.rank}-{t1.b.name}"
-        team2 = f"{t2.a.rank}-{t2.a.name} & {t2.b.rank}-{t2.b.name}"
-        lines.append(f"| {i} | {team1} | {team2} | {t1.avg_rank:.1f} | {t2.avg_rank:.1f} |\n")
+        if debug:
+            team1 = f"{t1.a.rank}-{t1.a.name} & {t1.b.rank}-{t1.b.name}"
+            team2 = f"{t2.a.rank}-{t2.a.name} & {t2.b.rank}-{t2.b.name}"
+        else:
+            team1 = f"{t1.a.name} & {t1.b.name}"
+            team2 = f"{t2.a.name} & {t2.b.name}"
+        lines.append(f"| {i} | {team1} | {team2} |\n")
 
     lines.append("\n")
     return "".join(lines)
@@ -786,7 +802,7 @@ def main():
 
     sched = Scheduler(cfg, params, debug=args.debug)
     queue = sched.build_play_order()
-    md = render_play_order_md(cfg, params, queue)
+    md = render_play_order_md(cfg, params, queue, debug=args.debug)
     print(md)
     if args.output_md:
         os.makedirs(os.path.dirname(args.output_md), exist_ok=True)
