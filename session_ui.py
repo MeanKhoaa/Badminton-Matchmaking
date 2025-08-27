@@ -1,164 +1,248 @@
 #!/usr/bin/env python3
 """
-Badminton Matchmaking – Session UI (Fixed Horizon + Auto-Relax)
-
-- Reads players.json/md (from app.py)
-- Prompts for key knobs used by scheduler.py
-- Scheduler now:
-  * uses FIXED rolling horizon = court_no
-  * auto-relaxes constraints stepwise if no batch can be found
-  * strictly prevents double-booking via sliding window
-
-Run:
-  python session_ui.py --input players.json --debug
+Session UI (v3.1)
+- Minimal knobs: average minutes, seed, debug.
+- Generates play order in blocks; after each block you can log what was played
+  and choose to continue scheduling more for the same session.
+- Resumes from previous session log if roster hasn't changed (opt-in).
+- Logs only the matches you confirm as played; the next block is generated
+  from a fresh Scheduler warmed by the accumulated log so far.
 """
 
-import argparse
-import datetime
+import json
 import os
+import sys
+from datetime import datetime
+from typing import List, Dict, Any
 
-from scheduler import (
-    load_config,
-    ScheduleParams,
-    Scheduler,
-    render_play_order_md,
-    print_debug_summary,
-)
+# Import local scheduler
+import scheduler
+from scheduler import SessionConfig, ScheduleParams, Scheduler
 
+PLAYERS_JSON = "players.json"
+OUTPUT_DIR = "outputs"
+LOG_JSON = os.path.join(OUTPUT_DIR, "session_log.json")       # append-only JSONL
+LAST_PLAYERS_SNAPSHOT = os.path.join(OUTPUT_DIR, "players_snapshot.json")
 
-def _prompt_float(prompt: str, default: float) -> float:
-    raw = input(f"{prompt} [{default}]: ").strip()
-    return float(raw) if raw else float(default)
+# ---------- Utilities ----------
 
+def ensure_outputs_dir():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-def _prompt_int(prompt: str, default: int) -> int:
-    raw = input(f"{prompt} [{default}]: ").strip()
-    return int(raw) if raw else int(default)
+def load_players_json(path: str) -> SessionConfig:
+    if not os.path.exists(path):
+        print(f"[ERROR] {path} not found. Run app.py first.")
+        sys.exit(1)
+    return scheduler.load_config(path)
 
+def same_player_roster(cfg: SessionConfig, snapshot_path: str) -> bool:
+    if not os.path.exists(snapshot_path):
+        return False
+    try:
+        with open(snapshot_path, "r", encoding="utf-8") as f:
+            snap = json.load(f)
+        cur = [{"rank": p.rank, "name": p.name, "gender": p.gender} for p in cfg.players]
+        return (snap.get("players") == cur
+                and snap.get("court_no") == cfg.court_no
+                and snap.get("player_amount") == cfg.player_amount)
+    except Exception:
+        return False
 
-def _prompt_yesno(prompt: str, default_yes: bool) -> bool:
-    d = "Y/n" if default_yes else "y/N"
-    raw = input(f"{prompt} ({d}): ").strip().lower()
-    if not raw:
-        return default_yes
-    return raw in ("y", "yes", "1", "true", "t")
+def save_players_snapshot(cfg: SessionConfig, snapshot_path: str):
+    data = {
+        "court_no": cfg.court_no,
+        "player_amount": cfg.player_amount,
+        "players": [{"rank": p.rank, "name": p.name, "gender": p.gender} for p in cfg.players],
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    with open(snapshot_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
+def parse_log_matches(log_path: str) -> List[Dict[str, Any]]:
+    matches = []
+    if not os.path.exists(log_path):
+        return matches
+    with open(log_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if obj.get("type") == "match":
+                    matches.append(obj)
+            except Exception:
+                pass
+    return matches
 
-def _parse_three_floats(label: str, default_csv: str) -> tuple[float, float, float]:
-    raw = input(f"{label} [{default_csv}]: ").strip()
-    csv = raw if raw else default_csv
-    parts = [p.strip() for p in csv.split(",")]
-    if len(parts) != 3:
-        raise ValueError(f"{label} must be three comma-separated numbers")
-    return float(parts[0]), float(parts[1]), float(parts[2])
+def apply_log_to_scheduler(sched: Scheduler, past: List[Dict[str, Any]]):
+    """Warm the scheduler with history of played matches only."""
+    by_rank = sched.players_by_rank
+    for m in past:
+        try:
+            t1 = m["team1"]  # [r1, r2]
+            t2 = m["team2"]  # [r3, r4]
+            r1, r2 = sorted(t1)
+            r3, r4 = sorted(t2)
+        except Exception:
+            continue
 
+        # update games
+        for rk in (r1, r2, r3, r4):
+            if rk in by_rank:
+                sched.games_played[rk] += 1
 
-def run_session(input_path: str, debug_flag: bool = False):
-    cfg = load_config(input_path)
+        # teammate pairs
+        pair1 = frozenset((r1, r2))
+        pair2 = frozenset((r3, r4))
+        sched.teammate_counts[pair1] += 1
+        sched.teammate_counts[pair2] += 1
 
-    print("\n=== Session Setup ===")
-    print(f"Courts: {cfg.court_no}, Duration: {cfg.court_duration} min, Players: {cfg.player_amount}")
-    print("Note: Scheduler uses fixed rolling horizon = number of courts and auto-relaxes if needed.\n")
+        # opponents
+        for e in (frozenset((r1, r3)), frozenset((r1, r4)),
+                  frozenset((r2, r3)), frozenset((r2, r4))):
+            sched.opponent_counts[e] += 1
 
-    # Core timing / fairness
-    avg_match = _prompt_int("Average minutes per match", 10)
-    rank_tol = _prompt_int("Base rank tolerance (evenness)", 1)
-    rank_tol_opp_extra = _prompt_int("Extra tolerance for G<->P matches", 1)
-    seed = _prompt_int("Random seed", 42)
+        # full match key
+        mk = tuple(sorted([(min(r1, r2), max(r1, r2)),
+                           (min(r3, r4), max(r3, r4))]))
+        sched.used_match_keys.add(mk)
 
-    # Gender priority (soft bonus)
-    gender_priority = _prompt_yesno("Enforce gender priority (soft bonus)", True)
+        # pool mix buckets (teammate-only)
+        a, b = by_rank.get(r1), by_rank.get(r2)
+        c, d = by_rank.get(r3), by_rank.get(r4)
+        if a and b:
+            sched.mix_counts[a.rank][sched._mix_bucket(a, b)] += 1
+            sched.mix_counts[b.rank][sched._mix_bucket(b, a)] += 1
+        if c and d:
+            sched.mix_counts[c.rank][sched._mix_bucket(c, d)] += 1
+            sched.mix_counts[d.rank][sched._mix_bucket(d, c)] += 1
 
-    # Pool split (how players are classified into G/A/P by rank percentiles)
-    print("\n--- Pool Split (classification by rank) ---")
-    ps_g, ps_a, ps_p = _parse_three_floats("Pool split fractions G,A,P", "0.25,0.45,0.30")
-
-    # Per-pool teammate mix ratios
-    print("\n--- Per-Pool Teammate Mix Ratios (Same,Avg,Opp) ---")
-    rG = _parse_three_floats("Good ratios (Same,Avg,Opp)", "0.50,0.25,0.25")
-    rA = _parse_three_floats("Average ratios (Same,Avg,Opp)", "0.50,0.25,0.25")
-    rP = _parse_three_floats("Poor ratios (Same,Avg,Opp)", "0.20,0.55,0.25")
-    avg_opp_split = _prompt_float("Average player's Opp split G/P (0..1 => % to G)", 0.5)
-
-    # Weights / Caps
-    print("\n--- Weights & Caps ---")
-    w_pool = _prompt_float("Weight: pool quota steering", 15.0)
-    w_var = _prompt_float("Weight: teammate variety penalty", 12.0)
-    w_oppvar = _prompt_float("Weight: opponent variety penalty", 6.0)
-    w_fair = _prompt_float("Weight: fairness (catch-up)", 8.0)
-    w_gender = _prompt_float("Weight: gender bonus", 2.0)
-
-    cap_use_override = _prompt_yesno("Set explicit teammate cap (max times same teammates pair)?", False)
-    cap_override = None
-    if cap_use_override:
-        cap_override = _prompt_int("Teammate cap (number)", 3)
-    cap_ratio = _prompt_float("Teammate cap ratio (if no explicit cap, cap = ceil(target_per_player * ratio))", 0.25)
-
-    # Adaptive (recommended ON)
-    print("\n--- Adaptive Catch-up (recommended ON) ---")
-    adaptive_on = _prompt_yesno("Enable adaptive weights", True)
-    adapt_pool = _prompt_float("Adaptive strength: pool quotas (0..1)", 0.5)
-    adapt_fair = _prompt_float("Adaptive strength: fairness (0..1)", 0.35)
-    adapt_thresh = _prompt_float("Adaptive games-deficit threshold before boosting", 1.0)
-
-    # Build params (no horizon knob here; it’s fixed inside scheduler)
-    params = ScheduleParams(
-        average_match_minutes=avg_match,
-        rank_tolerance=rank_tol,
-        rank_tolerance_opp_extra=rank_tol_opp_extra,
-        enforce_gender_priority=gender_priority,
-        random_seed=seed,
-
-        pool_split_g=ps_g, pool_split_a=ps_a, pool_split_p=ps_p,
-
-        ratio_same_G=rG[0], ratio_avg_G=rG[1], ratio_opp_G=rG[2],
-        ratio_same_A=rA[0], ratio_avg_A=rA[1], ratio_opp_A=rA[2],
-        ratio_same_P=rP[0], ratio_avg_P=rP[1], ratio_opp_P=rP[2],
-        avg_opp_split=avg_opp_split,
-
-        w_pool_quota=w_pool,
-        w_variety=w_var,
-        w_opp_variety=w_oppvar,
-        w_fair=w_fair,
-        w_gender_bonus=w_gender,
-
-        teammate_cap_override=cap_override,
-        teammate_cap_ratio=cap_ratio,
-
-        adaptive_on=adaptive_on,
-        adapt_pool_strength=adapt_pool,
-        adapt_fair_strength=adapt_fair,
-        adapt_games_threshold=adapt_thresh,
-    )
-
-    # Schedule
-    sched = Scheduler(cfg, params)
-    play_order = sched.build_play_order()
-
-    # Render + save
-    md = render_play_order_md(cfg, params, play_order)
-    print("\n" + md)
-
-    os.makedirs("outputs", exist_ok=True)
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    outpath = f"outputs/play_order_{ts}.md"
-    with open(outpath, "w", encoding="utf-8") as f:
+def render_and_save(queue, cfg: SessionConfig, params: ScheduleParams) -> str:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_md = os.path.join(OUTPUT_DIR, f"play_order_{ts}.md")
+    md = scheduler.render_play_order_md(cfg, params, queue)  # already without Gender column
+    with open(out_md, "w", encoding="utf-8") as f:
         f.write(md)
-    print(f"Saved: {os.path.abspath(outpath)}")
+    print(md)
+    print(f"Saved: {os.path.abspath(out_md)}")
+    return out_md
 
-    # Debug summary
-    if debug_flag:
-        print_debug_summary(cfg, sched, play_order)
+def append_log(matches, upto_idx: int):
+    with open(LOG_JSON, "a", encoding="utf-8") as f:
+        for i, m in enumerate(matches, start=1):
+            if i > upto_idx:
+                break
+            t1 = sorted([m.team1.a.rank, m.team1.b.rank])
+            t2 = sorted([m.team2.a.rank, m.team2.b.rank])
+            obj = {
+                "type": "match",
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "idx": i,
+                "team1": t1,
+                "team2": t2,
+            }
+            f.write(json.dumps(obj) + "\n")
 
+# ---------- Main Flow ----------
 
 def main():
-    ap = argparse.ArgumentParser(description="Badminton matchmaking – session UI (fixed horizon, auto-relax)")
-    ap.add_argument("--input", default="players.json", help="players.json or players.md")
-    ap.add_argument("--debug", action="store_true", help="print detailed debug summary")
-    args = ap.parse_args()
+    print("=== Session Setup ===")
+    ensure_outputs_dir()
+    cfg = load_players_json(PLAYERS_JSON)
+    print(f"Courts: {cfg.court_no}, Duration: {cfg.court_duration} min, Players: {cfg.player_amount}")
 
-    run_session(args.input, debug_flag=args.debug)
+    # Minimal knobs
+    try:
+        avg = int(input("Average minutes per match [10]: ").strip() or "10")
+    except Exception:
+        avg = 10
+    try:
+        seed = int(input("Random seed [42]: ").strip() or "42")
+    except Exception:
+        seed = 42
+    debug = (input("Debug mode? [y/N]: ").strip().lower() == "y")
 
+    params = ScheduleParams(
+        average_match_minutes=avg,
+        rank_tolerance=1,
+        rank_tolerance_opp_extra=1,
+        enforce_gender_priority=True,
+        random_seed=seed,
+        fairness="med",
+    )
+
+    # Resume logic: only if roster unchanged AND user opts-in
+    resume_ok = same_player_roster(cfg, LAST_PLAYERS_SNAPSHOT)
+    if resume_ok and os.path.exists(LOG_JSON):
+        yn = input("Resume from previous session log? [Y/n]: ").strip().lower()
+        if yn not in ("", "y", "yes"):
+            try:
+                os.remove(LOG_JSON)
+            except Exception:
+                pass
+    else:
+        # roster changed; reset log automatically
+        if os.path.exists(LOG_JSON):
+            print("[INFO] Player base changed or no snapshot — clearing old session log.")
+            try:
+                os.remove(LOG_JSON)
+            except Exception:
+                pass
+
+    # Save snapshot (for next-session resume check)
+    save_players_snapshot(cfg, LAST_PLAYERS_SNAPSHOT)
+
+    # ===== Loop: schedule -> log -> optional continue =====
+    block_no = 0
+    while True:
+        block_no += 1
+        # Fresh scheduler warmed by *played* history
+        sched = Scheduler(cfg, params, debug=debug)
+        past_matches = parse_log_matches(LOG_JSON)
+        if past_matches:
+            apply_log_to_scheduler(sched, past_matches)
+            if debug:
+                print(f"[DEBUG] Warmed scheduler with {len(past_matches)} past matches from log.")
+
+        queue = sched.build_play_order()
+        if not queue:
+            print("[WARN] No matches could be scheduled. Try changing roster or knobs.")
+            break
+
+        print(f"\n>>> Running scheduler... (block {block_no})\n")
+        out_md = render_and_save(queue, cfg, params)
+
+        # End / continue controls
+        print("\n=== End of Block ===")
+        print(f"Matches generated in this block: {len(queue)}")
+        raw = input("Enter the last match number actually played in THIS BLOCK "
+                    "(Enter = all; 0 = none): ").strip()
+        if raw == "":
+            upto = len(queue)
+        else:
+            try:
+                upto = int(raw)
+            except Exception:
+                upto = len(queue)
+        upto = max(0, min(upto, len(queue)))
+
+        if upto > 0:
+            append_log(queue, upto)
+            print(f"Recorded matches 1..{upto} (block {block_no}) to: {os.path.abspath(LOG_JSON)}")
+        else:
+            print("No matches recorded from this block.")
+
+        if debug:
+            print()
+            scheduler.print_debug_summary(cfg, sched, queue)
+
+        # Continue?
+        cont = input("Schedule more now? [y/N]: ").strip().lower()
+        if cont not in ("y", "yes"):
+            break
+
+    print("\nSession complete. Have a great one! 👏")
 
 if __name__ == "__main__":
     main()
