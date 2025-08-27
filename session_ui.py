@@ -121,10 +121,12 @@ def apply_log_to_scheduler(sched: Scheduler, past: List[Dict[str, Any]]):
             sched.mix_counts[c.rank][sched._mix_bucket(c, d)] += 1
             sched.mix_counts[d.rank][sched._mix_bucket(d, c)] += 1
 
-def render_and_save(queue, cfg: SessionConfig, params: ScheduleParams) -> Path:
+def render_and_save(queue, cfg: SessionConfig, params: ScheduleParams, debug: bool) -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_md = OUTPUT_DIR / f"play_order_{ts}.md"
-    md = scheduler.render_play_order_md(cfg, params, queue)  # output omits gender and rank numbers
+    md = scheduler.render_play_order_md(
+        cfg, params, queue, debug=debug
+    )  # output omits gender unless debug mode shows ranks
     with out_md.open("w", encoding="utf-8") as f:
         f.write(md)
     print(md)
@@ -216,7 +218,7 @@ def main():
             break
 
         print(f"\n>>> Running scheduler... (block {block_no})\n")
-        out_md = render_and_save(queue, cfg, params)
+        out_md = render_and_save(queue, cfg, params, debug)
 
         # End / continue controls
         print("\n=== End of Block ===")
