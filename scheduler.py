@@ -27,6 +27,7 @@ import os
 import random
 import re
 from collections import defaultdict, deque
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
 
 # --------------------------------------------------------------------------- #
@@ -61,25 +62,28 @@ class ScheduleParams:
 # Load config (JSON/MD from app.py)
 # --------------------------------------------------------------------------- #
 
-def load_config(path: str) -> SessionConfig:
-    if path.endswith(".json"):
-        with open(path, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        players = [Player(**p) for p in d["players"]]
-        players.sort(key=lambda p: p.rank)
-        return SessionConfig(
-            court_no=int(d["court_no"]),
-            court_duration=int(d["court_duration"]),
-            player_amount=int(d["player_amount"]),
-            players=players,
-        )
-    elif path.endswith(".md"):
-        return _load_md_minimal(path)
-    else:
-        raise ValueError("Provide a .json or .md produced by app.py")
+def load_config(path: str | Path) -> SessionConfig:
+    path = Path(path)
+    if path.suffix.lower() == ".json":
+        return _load_json_config(path)
+    if path.suffix.lower() == ".md":
+        return _load_md_config(path)
+    raise ValueError("Provide a .json or .md produced by app.py")
 
-def _load_md_minimal(path: str) -> SessionConfig:
-    with open(path, "r", encoding="utf-8") as f:
+def _load_json_config(path: Path) -> SessionConfig:
+    with path.open("r", encoding="utf-8") as f:
+        d = json.load(f)
+    players = [Player(**p) for p in d["players"]]
+    players.sort(key=lambda p: p.rank)
+    return SessionConfig(
+        court_no=int(d["court_no"]),
+        court_duration=int(d["court_duration"]),
+        player_amount=int(d["player_amount"]),
+        players=players,
+    )
+
+def _load_md_config(path: Path) -> SessionConfig:
+    with path.open("r", encoding="utf-8") as f:
         lines = f.readlines()
     kv: Dict[str, int] = {}
     for line in lines:
