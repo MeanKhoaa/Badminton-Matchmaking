@@ -1,246 +1,219 @@
-# Badminton Matchmaking
+- Prevents a player from appearing twice across the active sliding window of courts
+- Keeps matches reasonably even using rank-based team average tolerance
+- Encourages teammate and opponent variety
+- Supports optional pairing preferences such as:
+  - `with`
+  - `against`
+- Supports live session events:
+  - player steps out
+  - player resumes
+  - player abandons the session
+- Records only matches that were actually played
+- Rebuilds future matches from the current point onward during the session
 
-Matchmaking engine for recurring badminton socials.  
-Generates a **play order** (queue of matches) that keeps games fair, spreads playtime evenly, respects a sliding window (no double-booking across active courts), encourages variety, and follows per-pool teammate mix ratios.
+## Project Structure
 
----
-
-## ✨ Features
-
-- **Play order (not rounds):** courts fill as they free up.
-- **Sliding window = #courts:** in any stretch of `<court_no>` consecutive matches, no player appears twice.
-- **Even matches:** team averages within a configurable rank tolerance.
-- **Pool mix quotas (per player, per pool):**
-  - Good & Average: **50% Same / 25% Avg / 25% Opp**
-  - Poor: **20% Same / 55% Avg / 25% Opp**
-  - Average players split Opp between Good/Poor via `avg_opp_split` (default 50/50).
-- **Variety controls:** hard cap on repeated teammates + penalties for repeated teammates **and** repeated opponents.
-- **Adaptive catch-up:** boosts players who are behind on games or pool quotas so they “catch up” before session ends.
-- **Smarter gender priority:** prefers mm/mf/ff when feasible (soft bonus).
-- **Rolling horizon:** chooses up to `<court_no>` matches per step to reduce myopic choices.
-- **Couple bias:** optional “with/against” hints (soft).
-
----
-
-## 📦 What’s in this repo.
-├─ app.py # Build/edit the player list for a new session (interactive).
-├─ scheduler.py # Core algorithm. Also runnable directly (CLI).
-├─ session_ui.py # Interactive runner that exposes knobs & saves outputs.
-├─ outputs/ # Generated match schedules (.md).
+```text
+.
+├─ app.py
+├─ scheduler.py
+├─ session_ui.py
+├─ players.json
+├─ players.md
+├─ outputs/
 └─ README.md
+Requirements
+Python 3.10 or newer
+Git optional, if you want to clone from GitHub rather than download ZIP
+Setup
 
+Clone the repository:
 
-> **Important:** Running `app.py` is for setting up a **new player base**. By design, it **discards** existing `players.json` and `players.md` so you always start clean when players change. Use `session_ui.py` for day-to-day session scheduling.
-
----
-
-## 🖥️ Requirements
-
-- **Python 3.10+**  
-  - Windows (PowerShell):
-    ```powershell
-    winget install Python.Python.3
-    ```
-  - macOS (Homebrew):
-    ```bash
-    brew install python
-    ```
-  - Linux (Debian/Ubuntu):
-    ```bash
-    sudo apt-get update && sudo apt-get install -y python3 python3-pip
-    ```
-
-- **Git** (to clone the repo)
-  - Windows:
-    ```powershell
-    winget install Git.Git
-    ```
-  - macOS:
-    ```bash
-    brew install git
-    ```
-  - Linux:
-    ```bash
-    sudo apt-get install -y git
-    ```
-
-> If you don’t want Git, click **Code → Download ZIP** on GitHub, then unzip.
-
----
-
-## 🚀 Quick Start
-
-1) **Clone** and enter the folder:
-```bash
 git clone https://github.com/<your-user>/<your-repo>.git
 cd <your-repo>
 
-Create players (new session setup):
+Or download the repository as a ZIP and extract it.
+
+Step 1 — Build the Player List
+
+Run:
 
 python app.py
 
+This will ask you for:
 
-This interactively asks for:
+number of courts
+session duration in minutes
+number of players
+each player’s:
+rank
+name
+gender
+optional pair preferences
 
-courts, session duration, player count,
+It writes two files:
 
-each player’s name, gender, (optional) pairing & “with/against”.
+players.json — used by the scheduler
+players.md — readable summary for humans
+Important
 
-It writes:
+Running app.py resets the player files for a fresh setup. Use it when the player base changes. Do not use it during a live session unless you intend to replace the roster.
 
-players.json (machine-readable)
+Step 2 — Run the Session
 
-players.md (human-editable)
+Run:
 
-Re-run app.py whenever the player base changes. It will replace the existing files.
+python session_ui.py
 
-Generate a schedule (recommended UI):
+The UI will ask for:
 
-python session_ui.py --debug
+average minutes per match
+random seed
+whether debug mode should be enabled
 
+It then generates the current play order and lets you manage the session live.
 
-Prompts for knobs (defaults shown).
+Live Session Commands
 
-Prints the play order.
+Inside session_ui.py, use commands like these:
 
-Saves to outputs/play_order_<timestamp>.md.
+played 4
+Alice step out
+Alice resume
+Alice abandon
+show
+status
+fairness
+help
+quit
+What these commands do
+played N
+Records all matches through match number N as actually played.
+<name> step out
+Removes that player from future scheduling from the current next unplayed match onward.
+<name> resume
+Returns that player to future scheduling from the current next unplayed match onward.
+<name> abandon
+Removes that player for the rest of the session.
+show
+Shows upcoming scheduled matches.
+status
+Shows current player status, including who is active, stepped out, or abandoned.
+fairness
+Shows fairness-related counts for each player.
+quit
+Saves the session state and exits.
+Live Session Workflow
 
---debug prints a summary (games per player, pool mix vs targets, repeated teammates/opponents, etc.).
+A typical session looks like this:
 
-(Alternative) Run the scheduler directly:
+Before the session
 
-python scheduler.py --input players.json --output-md outputs/schedule.md --rank-tol 1 --seed 42
+Run:
 
-🔧 Key Concepts & Knobs
-Sliding Window
+python app.py
 
-Automatically set to court_no.
+to build the player roster.
 
-In any court_no consecutive matches in the play order, a player can appear at most once.
+At the start of the session
 
-Evenness
+Run:
 
---rank-tol: base tolerance for team average rank difference (default 1).
+python session_ui.py
 
---rank-tol-opp-extra: additional tolerance for G↔P clashes (default 1) to help meet “Opp” quotas.
+and generate the initial queue.
 
-Pools & Ratios
+During the session
 
-Pool split (by rank percentile): G, A, P = 0.25, 0.45, 0.30 (default).
+Use the queue as your play order.
 
-Per-pool teammate mix ratios:
+When matches are actually completed, record them with:
 
-Good: 0.50,0.25,0.25 (Same, Avg, Opp)
+played N
 
-Average: 0.50,0.25,0.25
+For example:
 
-Poor: 0.20,0.55,0.25
+played 4
 
-avg_opp_split: Average players’ Opp split to G/P (default 0.5).
+This means matches 1 to 4 were played and are now part of session history.
 
-Variety
+If a player becomes unavailable before the next match, apply the roster change before continuing:
 
-Hard cap on same teammates (per session):
+Alice step out
 
-Default = ceil(target_games_per_player * 0.25) (e.g., if target is 12 games → cap 3).
+The scheduler will keep matches 1 to 4 as history and rebuild future matches from match 5 onward without Alice.
 
-Override via explicit cap.
+When Alice returns:
 
-Soft penalties:
+Alice resume
 
-Repeated teammates (non-linear).
+Future matches are rebuilt again from the current point onward.
 
-Repeated opponents.
+Fairness Model
 
-Adaptive Catch-Up
+The live session UI uses an eligibility-aware fairness model.
 
-If a player falls behind on games or pool quotas, the scoring boosts pairings that help them catch up.
+It tracks:
 
-Tuned via:
+played_games — matches the player actually played
+eligible_slots — match slots the player was available for
+effective_games — a fairness value used to avoid penalising players for time they were unavailable
 
-adapt_pool_strength (default 0.5)
+This means a player who steps out temporarily does not look unfairly behind just because they missed games while unavailable.
 
-adapt_fair_strength (default 0.35)
+Running the Scheduler Directly
 
-adapt_games_threshold (default 1.0 game)
+You can also run the scheduler directly without the live session UI:
 
-Rolling Horizon
+python scheduler.py --input players.json --output-md outputs/schedule.md --avg 10 --seed 42 --debug
 
-Picks up to <court_no> matches per step to reduce short-sighted decisions.
+This prints the generated play order and optionally saves it to a Markdown file.
 
-Toggle in session_ui.py prompt (“Pick multiple matches per step”).
+Player File Format
 
-🧭 Typical Session Flow
-
-Before the season / when players change
-Run python app.py to (re)build players.json & players.md.
-
-Each social night
-Run python session_ui.py --debug, accept defaults or tweak knobs.
-
-During the night
-Use the play order as a queue; as courts free up, take the next match.
-
-At session end
-If you end early (e.g., courts closed at match #50 out of 96 generated), log only the first 50 — the UI can ask for the “last played index” and record that (optional; add this if you want persistent logs).
-
-🧪 Examples
-
-Generate with loose tolerance and stronger variety:
-
-python scheduler.py --input players.json --output-md outputs/sched.md \
-  --rank-tol 2 --w-variety 14 --w-opp-variety 8 --seed 7
-
-
-Use custom pool ratios (e.g., Average more Opp = 60%):
-
-python scheduler.py --input players.json \
-  --ratio-A 0.50,0.20,0.30 --avg-opp-split 0.6
-
-
-Cap teammates to 2:
-
-python scheduler.py --input players.json --cap 2
-
-🧾 Players File Format
-
-players.md (human-editable):
+Example players.md:
 
 court_no: 4
 court_duration: 120
 player_amount: 24
 
-| Rank | Name     | Gender | PairedWithRank | PairingPref |
-| ---- | -------- | ------ | -------------- | ----------- |
-| 1    | Steven   | m      |                |             |
-| 2    | Duong    | m      | 3              | with        |
-| 3    | Khuong   | m      | 2              | with        |
-| 4    | Nam      | m      |                |             |
-| ...  | ...      | ...    | ...            | ...         |
+| Rank | Name   | Gender | Paired_with_rank | Pairing_pref |
+|----:|------|:------:|:----------------:|:------------:|
+| 1 | Steven | m |  |  |
+| 2 | Duong  | m | 3 | with |
+| 3 | Khuong | m | 2 | with |
+| 4 | Nam    | m |  |  |
+Notes
+gender must be m or f
+paired_with_rank is optional
+pairing_pref is optional and can be:
+with
+against
+Troubleshooting
+players.json not found
 
+Run:
 
-Notes:
+python app.py
 
-Gender is m or f.
+first.
 
-PairingPref optional: with or against.
+No future matches can be generated
 
-PairedWithRank is the partner’s rank (numeric) if using a couple preference.
+Common causes:
 
-❓Troubleshooting
+too few active players
+pair constraints too restrictive
+player count too awkward for the current active roster
+Player name not recognised
 
-python not found / pip not found
-Install Python and ensure it’s on PATH. On Windows, re-run the installer with “Add python.exe to PATH”.
-Or use the winget command above.
+Use the exact player name entered in app.py, or a unique partial match.
 
-Git prompts for login
-If the repo is private, you need to sign in.
-Make it Public on GitHub → Settings → General → Danger Zone → Change visibility.
+Resume did not appear to change the queue
 
-Only a few matches generated
-Tight constraints can make later matches infeasible (e.g., very strict rank_tol, heavy couple constraints).
-Try increasing --rank-tol by 1, or allow rolling horizon, or relax gender priority.
+Roster events apply from the current next unplayed match onward. Record completed matches first using played N, then apply the roster change.
 
-Too many repeated teammates
-Lower the cap (e.g., --cap 2) and/or raise --w-variety.
-Turn on --debug to see repeats at the end.
+Recommended Usage
+Use app.py only when setting up or changing the player base
+Use session_ui.py during the actual club night
+Use scheduler.py directly only if you want a one-off generated queue without live management
