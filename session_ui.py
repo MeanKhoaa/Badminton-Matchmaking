@@ -1,44 +1,57 @@
 #!/usr/bin/env python3
 """
-Session UI (event-driven, eligibility-aware fairness)
+Session UI for the rewritten scheduler.
 
-What this version does
-- Keeps scheduler.py as the match engine.
-- Records only matches actually played.
-- Supports live roster events at the CURRENT next unplayed match:
-    - <name> step out
-    - <name> resume
-    - <name> abandon
-- Rebuilds future play order from the current point onward.
-- Avoids fake credit for players who were unavailable.
+Assumptions
+-----------
+- This file is written for the rewritten `scheduler.py` that supports:
+    - next_unplayed_game_no(...)
+    - next_round_boundary_game_no(...)
+    - regenerate_schedule(..., regen_policy=...)
+- Availability events use regen_policy="next_unplayed"
+- Rank changes use regen_policy="round_boundary"
 
-Fairness model
-- played_games: actual matches played
-- eligible_slots: how many scheduled match slots the player was available for
-- absent_slots: elapsed_slots - eligible_slots
-- effective_games = played_games + absent_slots
-
-We preload scheduler.games_played with effective_games so a player who stepped out
-is not treated as unfairly "behind" just because they were unavailable.
-
-Notes
-- Events apply at the current pointer only, not at arbitrary future match numbers.
-- This keeps the logic simple and reliable for live club use.
+Commands
+--------
+  played N         Record all matches through match number N as played
+  <name> step out  Remove a player from future scheduling immediately
+  <name> resume    Return a stepped-out player to future scheduling
+  <name> abandon   Remove a player for the rest of the session
+  <name> rank N    Move a player to absolute rank position N (next round only)
+  show             Show upcoming matches
+  status           Show session status
+  fairness         Show played counts
+  help             Show this help
+  quit             Save and exit
 """
 
 from __future__ import annotations
 
-import copy
 import json
 import os
 import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import scheduler
-from scheduler import SessionConfig, ScheduleParams, Scheduler
+from scheduler import (
+    Match,
+    Player,
+    PlayerRef,
+    RoundPlan,
+    ScheduleParams,
+    ScheduleState,
+    Scheduler,
+    SessionConfig,
+    Team,
+    clone_players,
+    load_config,
+    move_player_to_rank,
+    renumber_ranks,
+    set_player_active,
+)
 
 PLAYERS_JSON = "players.json"
 OUTPUT_DIR = "outputs"
@@ -47,66 +60,43 @@ EVENTS_JSONL = os.path.join(OUTPUT_DIR, "session_events.jsonl")
 SNAPSHOT_JSON = os.path.join(OUTPUT_DIR, "players_snapshot.json")
 
 
-# ---------------------------- Models ----------------------------
-
-@dataclass
-class PlayerSessionState:
-    rank: int
-    name: str
-    active: bool = True
-    abandoned: bool = False
-    played_games: int = 0
-    eligible_slots: int = 0
-
-    @property
-    def effective_games(self) -> int:
-        """Matches used for fairness seeding.
-
-        If a player was unavailable for some elapsed slots, count those as neutral
-        rather than letting them appear artificially underplayed.
-        """
-        absent_slots = max(0, SessionRuntime.elapsed_slots_global - self.eligible_slots)
-        return self.played_games + absent_slots
+# --------------------------------------------------------------------------- #
+# Runtime model
+# --------------------------------------------------------------------------- #
 
 
 @dataclass
 class SessionRuntime:
     base_cfg: SessionConfig
     params: ScheduleParams
-    player_states: Dict[int, PlayerSessionState]
-    played_matches: List[Dict[str, Any]] = field(default_factory=list)
+    state: ScheduleState
+    played_matches_count: int = 0
+    abandoned_ids: Set[str] = field(default_factory=set)
     roster_events: List[Dict[str, Any]] = field(default_factory=list)
-    current_queue: List[Any] = field(default_factory=list)  # scheduler.Match objects
-    queue_start_index: int = 1  # display numbering base for current queue
-
-    # class-level helper for effective_games property
-    elapsed_slots_global: int = 0
-
-    def update_elapsed_slots(self) -> None:
-        SessionRuntime.elapsed_slots_global = len(self.played_matches)
 
     @property
     def next_match_number(self) -> int:
-        return len(self.played_matches) + 1
-
-    def active_ranks(self) -> Set[int]:
-        return {rk for rk, ps in self.player_states.items() if ps.active and not ps.abandoned}
-
-    def active_player_count(self) -> int:
-        return len(self.active_ranks())
+        return self.played_matches_count + 1
 
 
-# ---------------------------- File helpers ----------------------------
+# --------------------------------------------------------------------------- #
+# File helpers
+# --------------------------------------------------------------------------- #
+
 
 def ensure_outputs_dir() -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-def load_players_json(path: str) -> SessionConfig:
-    if not os.path.exists(path):
-        print(f"[ERROR] {path} not found. Run app.py first.")
-        sys.exit(1)
-    return scheduler.load_config(path)
+def append_event_jsonl(obj: Dict[str, Any]) -> None:
+    with open(EVENTS_JSONL, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj) + "\n")
+
+
+def clear_old_runtime_files() -> None:
+    for path in (STATE_JSON, EVENTS_JSONL):
+        if os.path.exists(path):
+            os.remove(path)
 
 
 def same_player_roster(cfg: SessionConfig, snapshot_path: str) -> bool:
@@ -115,192 +105,249 @@ def same_player_roster(cfg: SessionConfig, snapshot_path: str) -> bool:
     try:
         with open(snapshot_path, "r", encoding="utf-8") as f:
             snap = json.load(f)
-        cur = [{
-            "rank": p.rank,
-            "name": p.name,
-            "gender": p.gender,
-            "paired_with_rank": p.paired_with_rank,
-            "pairing_pref": p.pairing_pref,
-        } for p in cfg.players]
-        return (
-            snap.get("players") == cur
-            and snap.get("court_no") == cfg.court_no
-            and snap.get("player_amount") == cfg.player_amount
-            and snap.get("court_duration") == cfg.court_duration
-        )
+
+        current = {
+            "court_no": cfg.court_no,
+            "court_duration": cfg.court_duration,
+            "player_amount": cfg.player_amount,
+            "players": [serialize_player(p) for p in renumber_ranks(cfg.players)],
+        }
+        return snap == current
     except Exception:
         return False
 
 
 def save_players_snapshot(cfg: SessionConfig, snapshot_path: str) -> None:
-    data = {
+    payload = {
         "court_no": cfg.court_no,
         "court_duration": cfg.court_duration,
         "player_amount": cfg.player_amount,
-        "players": [{
-            "rank": p.rank,
-            "name": p.name,
-            "gender": p.gender,
-            "paired_with_rank": p.paired_with_rank,
-            "pairing_pref": p.pairing_pref,
-        } for p in cfg.players],
-        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "players": [serialize_player(p) for p in renumber_ranks(cfg.players)],
     }
     with open(snapshot_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+        json.dump(payload, f, indent=2)
 
 
 def save_state(rt: SessionRuntime) -> None:
-    data = {
-        "played_matches": rt.played_matches,
-        "roster_events": rt.roster_events,
-        "player_states": {
-            str(rk): {
-                "rank": ps.rank,
-                "name": ps.name,
-                "active": ps.active,
-                "abandoned": ps.abandoned,
-                "played_games": ps.played_games,
-                "eligible_slots": ps.eligible_slots,
-            }
-            for rk, ps in rt.player_states.items()
-        },
-        "queue_start_index": rt.queue_start_index,
+    payload = {
         "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "played_matches_count": rt.played_matches_count,
+        "abandoned_ids": sorted(rt.abandoned_ids),
+        "roster_events": rt.roster_events,
+        "params": {
+            "average_match_minutes": rt.params.average_match_minutes,
+            "rank_tolerance": rt.params.rank_tolerance,
+            "random_seed": rt.params.random_seed,
+            "fairness": rt.params.fairness,
+        },
+        "schedule_state": serialize_schedule_state(rt.state),
     }
     with open(STATE_JSON, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+        json.dump(payload, f, indent=2)
 
 
-def load_state(rt: SessionRuntime) -> bool:
+def load_saved_runtime(base_cfg: SessionConfig) -> Optional[SessionRuntime]:
     if not os.path.exists(STATE_JSON):
-        return False
+        return None
+
     try:
         with open(STATE_JSON, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        rt.played_matches = data.get("played_matches", [])
-        rt.roster_events = data.get("roster_events", [])
-        raw_states = data.get("player_states", {})
-        for key, value in raw_states.items():
-            rk = int(key)
-            if rk in rt.player_states:
-                rt.player_states[rk].active = bool(value.get("active", True))
-                rt.player_states[rk].abandoned = bool(value.get("abandoned", False))
-                rt.player_states[rk].played_games = int(value.get("played_games", 0))
-                rt.player_states[rk].eligible_slots = int(value.get("eligible_slots", 0))
-        rt.queue_start_index = int(data.get("queue_start_index", len(rt.played_matches) + 1))
-        rt.update_elapsed_slots()
-        return True
+            payload = json.load(f)
+
+        params_raw = payload.get("params", {})
+        params = ScheduleParams(
+            average_match_minutes=int(params_raw.get("average_match_minutes", 10)),
+            rank_tolerance=int(params_raw.get("rank_tolerance", 1)),
+            random_seed=params_raw.get("random_seed", 42),
+            fairness=str(params_raw.get("fairness", "med")),
+        )
+
+        state = deserialize_schedule_state(payload["schedule_state"])
+        return SessionRuntime(
+            base_cfg=base_cfg,
+            params=params,
+            state=state,
+            played_matches_count=int(payload.get("played_matches_count", 0)),
+            abandoned_ids=set(payload.get("abandoned_ids", [])),
+            roster_events=list(payload.get("roster_events", [])),
+        )
     except Exception:
-        return False
+        return None
 
 
-def append_event_jsonl(obj: Dict[str, Any]) -> None:
-    with open(EVENTS_JSONL, "a", encoding="utf-8") as f:
-        f.write(json.dumps(obj) + "\n")
+# --------------------------------------------------------------------------- #
+# Serialisers
+# --------------------------------------------------------------------------- #
 
 
-# ---------------------------- Runtime helpers ----------------------------
-
-def build_initial_player_states(cfg: SessionConfig) -> Dict[int, PlayerSessionState]:
+def serialize_player(player: Player) -> Dict[str, Any]:
     return {
-        p.rank: PlayerSessionState(rank=p.rank, name=p.name)
-        for p in cfg.players
+        "id": player.id,
+        "rank": player.rank,
+        "name": player.name,
+        "gender": player.gender,
+        "active": player.active,
+        "paired_with_id": player.paired_with_id,
+        "pairing_pref": player.pairing_pref,
     }
 
 
-def find_player_by_name(rt: SessionRuntime, raw_name: str) -> Optional[PlayerSessionState]:
-    target = raw_name.strip().lower()
-    exact = [ps for ps in rt.player_states.values() if ps.name.lower() == target]
-    if len(exact) == 1:
-        return exact[0]
-
-    partial = [ps for ps in rt.player_states.values() if target in ps.name.lower()]
-    if len(partial) == 1:
-        return partial[0]
-    return None
-
-
-def build_active_cfg(rt: SessionRuntime) -> SessionConfig:
-    active_ranks = rt.active_ranks()
-    active_players = [copy.deepcopy(p) for p in rt.base_cfg.players if p.rank in active_ranks]
-
-    # Keep pair links only when both players are active.
-    active_rank_set = {p.rank for p in active_players}
-    for p in active_players:
-        if p.paired_with_rank not in active_rank_set:
-            p.paired_with_rank = None
-            p.pairing_pref = None
-
-    return SessionConfig(
-        court_no=rt.base_cfg.court_no,
-        court_duration=rt.base_cfg.court_duration,
-        player_amount=len(active_players),
-        players=active_players,
+def deserialize_player(data: Dict[str, Any]) -> Player:
+    return Player(
+        id=str(data["id"]),
+        rank=int(data["rank"]),
+        name=str(data["name"]),
+        gender=str(data["gender"]),
+        active=bool(data.get("active", True)),
+        paired_with_id=data.get("paired_with_id"),
+        pairing_pref=data.get("pairing_pref"),
     )
 
 
-def preload_scheduler_from_runtime(rt: SessionRuntime, sched: Scheduler, active_cfg: SessionConfig) -> None:
-    active_ranks = {p.rank for p in active_cfg.players}
-
-    # Seed fairness with effective games for active players only.
-    rt.update_elapsed_slots()
-    for rk in active_ranks:
-        ps = rt.player_states[rk]
-        sched.games_played[rk] = ps.effective_games
-
-    # Replay actual played history, but only for players active in the new roster.
-    by_rank = sched.players_by_rank
-    for m in rt.played_matches:
-        t1 = sorted(m["team1"])
-        t2 = sorted(m["team2"])
-        r1, r2 = t1
-        r3, r4 = t2
-
-        active_present = [rk for rk in (r1, r2, r3, r4) if rk in by_rank]
-        if len(active_present) >= 2:
-            if r1 in by_rank and r2 in by_rank:
-                sched.teammate_counts[frozenset((r1, r2))] += 1
-            if r3 in by_rank and r4 in by_rank:
-                sched.teammate_counts[frozenset((r3, r4))] += 1
-
-            opp_edges = ((r1, r3), (r1, r4), (r2, r3), (r2, r4))
-            for a, b in opp_edges:
-                if a in by_rank and b in by_rank:
-                    sched.opponent_counts[frozenset((a, b))] += 1
-
-            if all(rk in by_rank for rk in (r1, r2, r3, r4)):
-                mk = tuple(sorted([
-                    (min(r1, r2), max(r1, r2)),
-                    (min(r3, r4), max(r3, r4)),
-                ]))
-                sched.used_match_keys.add(mk)
-
-            for a, b in ((r1, r2), (r2, r1), (r3, r4), (r4, r3)):
-                if a in by_rank and b in by_rank:
-                    pa = by_rank[a]
-                    pb = by_rank[b]
-                    sched.mix_counts[a][sched._mix_bucket(pa, pb)] += 1
+def serialize_player_ref(ref: PlayerRef) -> Dict[str, Any]:
+    return {
+        "id": ref.id,
+        "rank": ref.rank,
+        "name": ref.name,
+        "gender": ref.gender,
+    }
 
 
-def regenerate_queue(rt: SessionRuntime) -> None:
-    active_cfg = build_active_cfg(rt)
-    rt.queue_start_index = rt.next_match_number
-
-    if active_cfg.player_amount < 4:
-        rt.current_queue = []
-        return
-
-    sched = Scheduler(active_cfg, rt.params, debug=False)
-    preload_scheduler_from_runtime(rt, sched, active_cfg)
-    rt.current_queue = sched.build_play_order()
+def deserialize_player_ref(data: Dict[str, Any]) -> PlayerRef:
+    return PlayerRef(
+        id=str(data["id"]),
+        rank=int(data["rank"]),
+        name=str(data["name"]),
+        gender=str(data["gender"]),
+    )
 
 
-def render_match_line(idx: int, match: Any) -> str:
+def serialize_match(match: Match) -> Dict[str, Any]:
+    return {
+        "logical_round_no": match.logical_round_no,
+        "team1": {
+            "a": serialize_player_ref(match.team1.a),
+            "b": serialize_player_ref(match.team1.b),
+        },
+        "team2": {
+            "a": serialize_player_ref(match.team2.a),
+            "b": serialize_player_ref(match.team2.b),
+        },
+    }
+
+
+def deserialize_match(data: Dict[str, Any]) -> Match:
+    return Match(
+        team1=Team(
+            deserialize_player_ref(data["team1"]["a"]),
+            deserialize_player_ref(data["team1"]["b"]),
+        ),
+        team2=Team(
+            deserialize_player_ref(data["team2"]["a"]),
+            deserialize_player_ref(data["team2"]["b"]),
+        ),
+        logical_round_no=int(data["logical_round_no"]),
+    )
+
+
+def serialize_round(round_plan: RoundPlan) -> Dict[str, Any]:
+    return {
+        "round_no": round_plan.round_no,
+        "bye_ids": list(round_plan.bye_ids),
+        "matches": [serialize_match(m) for m in round_plan.matches],
+    }
+
+
+def deserialize_round(data: Dict[str, Any]) -> RoundPlan:
+    return RoundPlan(
+        round_no=int(data["round_no"]),
+        bye_ids=list(data.get("bye_ids", [])),
+        matches=[deserialize_match(m) for m in data.get("matches", [])],
+    )
+
+
+def serialize_schedule_state(state: ScheduleState) -> Dict[str, Any]:
+    return {
+        "players": [serialize_player(p) for p in state.players],
+        "rounds": [serialize_round(r) for r in state.rounds],
+        "queue": [serialize_match(m) for m in state.queue],
+        "total_match_slots": state.total_match_slots,
+    }
+
+
+def deserialize_schedule_state(data: Dict[str, Any]) -> ScheduleState:
+    return ScheduleState(
+        players=[deserialize_player(p) for p in data["players"]],
+        rounds=[deserialize_round(r) for r in data["rounds"]],
+        queue=[deserialize_match(m) for m in data["queue"]],
+        total_match_slots=int(data["total_match_slots"]),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Runtime helpers
+# --------------------------------------------------------------------------- #
+
+
+def build_fresh_runtime(base_cfg: SessionConfig, params: ScheduleParams, debug: bool = False) -> SessionRuntime:
+    sched = Scheduler(base_cfg, params=params, debug=debug)
+    state = sched.build_schedule(players=base_cfg.players)
+    return SessionRuntime(base_cfg=base_cfg, params=params, state=state)
+
+
+def live_players(rt: SessionRuntime) -> List[Player]:
+    return clone_players(rt.state.players)
+
+
+def find_player(players: Sequence[Player], raw_name: str) -> Optional[Player]:
+    target = raw_name.strip().lower()
+
+    exact = [p for p in players if p.name.lower() == target or p.id == raw_name]
+    if len(exact) == 1:
+        return exact[0]
+
+    partial = [p for p in players if target in p.name.lower()]
+    if len(partial) == 1:
+        return partial[0]
+
+    return None
+
+
+def player_label(rt: SessionRuntime, player: Player) -> str:
+    if player.id in rt.abandoned_ids:
+        return "abandoned"
+    return "active" if player.active else "stepped out"
+
+
+def future_queue(rt: SessionRuntime) -> List[Match]:
+    return rt.state.queue[rt.played_matches_count:]
+
+
+def current_round_no(rt: SessionRuntime) -> Optional[int]:
+    queue = future_queue(rt)
+    if not queue:
+        return None
+    return queue[0].logical_round_no
+
+
+def played_counts(rt: SessionRuntime) -> Dict[str, int]:
+    counts: Dict[str, int] = {p.id: 0 for p in rt.state.players}
+    for match in rt.state.queue[: rt.played_matches_count]:
+        for player_id in match.player_ids():
+            counts[player_id] = counts.get(player_id, 0) + 1
+    return counts
+
+
+# --------------------------------------------------------------------------- #
+# Display helpers
+# --------------------------------------------------------------------------- #
+
+
+def render_match_line(idx: int, match: Match) -> str:
     t1 = match.team1
     t2 = match.team2
     return (
-        f"{idx}. "
+        f"{idx}. [R{match.logical_round_no}] "
         f"{t1.a.rank}-{t1.a.name} & {t1.b.rank}-{t1.b.name} "
         f"vs "
         f"{t2.a.rank}-{t2.a.name} & {t2.b.rank}-{t2.b.name}"
@@ -308,154 +355,55 @@ def render_match_line(idx: int, match: Any) -> str:
 
 
 def show_queue(rt: SessionRuntime, limit: int = 12) -> None:
-    if not rt.current_queue:
-        print("[INFO] No future matches currently schedulable.")
+    queue = future_queue(rt)
+    if not queue:
+        print("[INFO] No future matches currently scheduled.")
         return
+
     print("\n=== Upcoming Matches ===")
-    for i, match in enumerate(rt.current_queue[:limit], start=rt.queue_start_index):
+    start_no = rt.played_matches_count + 1
+    for i, match in enumerate(queue[:limit], start=start_no):
         print(render_match_line(i, match))
-    if len(rt.current_queue) > limit:
-        print(f"... and {len(rt.current_queue) - limit} more")
+    if len(queue) > limit:
+        print(f"... and {len(queue) - limit} more")
     print()
 
 
 def show_status(rt: SessionRuntime) -> None:
     print("\n=== Session Status ===")
-    print(f"Played matches: {len(rt.played_matches)}")
+    print(f"Played matches: {rt.played_matches_count}")
+    print(f"Total scheduled matches: {len(rt.state.queue)}")
     print(f"Next match number: {rt.next_match_number}")
-    print(f"Active players: {rt.active_player_count()}")
+
+    round_no = current_round_no(rt)
+    if round_no is None:
+        print("Current logical round: complete")
+    else:
+        print(f"Current logical round: {round_no}")
+
+    sched = Scheduler(rt.base_cfg, params=rt.params)
+    next_unplayed = sched.next_unplayed_game_no(rt.state, rt.played_matches_count)
+    next_round = sched.next_round_boundary_game_no(rt.state, rt.played_matches_count)
+    print(f"Next unplayed regeneration point: game #{next_unplayed}")
+    print(f"Next round-boundary regeneration point: game #{next_round}")
+
     print("Roster:")
-    for rk in sorted(rt.player_states):
-        ps = rt.player_states[rk]
-        if ps.abandoned:
-            label = "abandoned"
-        elif ps.active:
-            label = "active"
-        else:
-            label = "stepped out"
-        print(f"  {ps.rank:>2} {ps.name:<16} {label}")
+    for player in sorted(rt.state.players, key=lambda p: p.rank):
+        print(f"  {player.rank:>2} {player.name:<18} {player_label(rt, player)}")
     print()
 
 
 def show_fairness(rt: SessionRuntime) -> None:
-    rt.update_elapsed_slots()
-    rows: List[Tuple[int, str, bool, int, int, int]] = []
-    for rk in sorted(rt.player_states):
-        ps = rt.player_states[rk]
-        rows.append((
-            ps.rank,
-            ps.name,
-            ps.active and not ps.abandoned,
-            ps.played_games,
-            ps.eligible_slots,
-            ps.effective_games,
-        ))
+    counts = played_counts(rt)
 
     print("\n=== Fairness Snapshot ===")
-    print("Rank  Name             Active  Played  Eligible  Effective")
-    print("----  ---------------- ------  ------  --------  ---------")
-    for rank, name, active, played, eligible, effective in rows:
-        print(f"{rank:>4}  {name:<16} {str(active):<6}  {played:>6}  {eligible:>8}  {effective:>9}")
+    print("Rank  Name               Status       Played")
+    print("----  -----------------  -----------  ------")
+    for player in sorted(rt.state.players, key=lambda p: p.rank):
+        print(
+            f"{player.rank:>4}  {player.name:<17}  {player_label(rt, player):<11}  {counts.get(player.id, 0):>6}"
+        )
     print()
-
-
-def increment_eligibility_for_match(rt: SessionRuntime, match: Any) -> None:
-    participants = [
-        match.team1.a.rank, match.team1.b.rank,
-        match.team2.a.rank, match.team2.b.rank,
-    ]
-
-    # Every player who is active at the moment this match is played had this slot as an opportunity.
-    for rk, ps in rt.player_states.items():
-        if ps.active and not ps.abandoned:
-            ps.eligible_slots += 1
-
-    # Participants also receive a played count.
-    for rk in participants:
-        if rk in rt.player_states:
-            rt.player_states[rk].played_games += 1
-
-
-def record_played_through(rt: SessionRuntime, match_no: int) -> None:
-    if match_no < rt.queue_start_index:
-        print("[WARN] That match number is already in the past.")
-        return
-
-    end_idx = match_no - rt.queue_start_index + 1
-    if end_idx <= 0:
-        print("[WARN] Nothing to record.")
-        return
-    if end_idx > len(rt.current_queue):
-        print("[WARN] That match number is beyond the current generated queue.")
-        return
-
-    for offset in range(end_idx):
-        match = rt.current_queue[offset]
-        increment_eligibility_for_match(rt, match)
-        obj = {
-            "type": "match",
-            "ts": datetime.now().isoformat(timespec="seconds"),
-            "idx": rt.queue_start_index + offset,
-            "team1": sorted([match.team1.a.rank, match.team1.b.rank]),
-            "team2": sorted([match.team2.a.rank, match.team2.b.rank]),
-        }
-        rt.played_matches.append(obj)
-        append_event_jsonl(obj)
-
-    rt.current_queue = rt.current_queue[end_idx:]
-    rt.queue_start_index = rt.next_match_number
-    rt.update_elapsed_slots()
-    regenerate_queue(rt)
-    save_state(rt)
-    print(f"[OK] Recorded matches through #{match_no}.")
-
-
-def apply_roster_event(rt: SessionRuntime, name: str, action: str) -> None:
-    ps = find_player_by_name(rt, name)
-    if ps is None:
-        print("[WARN] Could not uniquely identify that player name.")
-        return
-
-    if action == "step out":
-        if ps.abandoned:
-            print(f"[WARN] {ps.name} has already abandoned the session.")
-            return
-        if not ps.active:
-            print(f"[WARN] {ps.name} is already stepped out.")
-            return
-        ps.active = False
-    elif action == "resume":
-        if ps.abandoned:
-            print(f"[WARN] {ps.name} has abandoned the session and cannot resume in this session state.")
-            return
-        if ps.active:
-            print(f"[WARN] {ps.name} is already active.")
-            return
-        ps.active = True
-    elif action == "abandon":
-        if ps.abandoned:
-            print(f"[WARN] {ps.name} has already abandoned the session.")
-            return
-        ps.active = False
-        ps.abandoned = True
-    else:
-        print("[WARN] Unknown action.")
-        return
-
-    obj = {
-        "type": "roster_event",
-        "ts": datetime.now().isoformat(timespec="seconds"),
-        "at_match": rt.next_match_number,
-        "player_rank": ps.rank,
-        "player_name": ps.name,
-        "action": action,
-    }
-    rt.roster_events.append(obj)
-    append_event_jsonl(obj)
-
-    regenerate_queue(rt)
-    save_state(rt)
-    print(f"[OK] Applied: {ps.name} {action} from match #{rt.next_match_number} onward.")
 
 
 def print_help() -> None:
@@ -465,12 +413,142 @@ def print_help() -> None:
         "  <name> step out  Temporarily remove a player from future scheduling\n"
         "  <name> resume    Return a stepped-out player to future scheduling\n"
         "  <name> abandon   Remove a player for the rest of the session\n"
+        "  <name> rank N    Move a player to absolute rank position N\n"
         "  show             Show upcoming matches\n"
-        "  status           Show roster status\n"
-        "  fairness         Show played / eligible / effective counts\n"
+        "  status           Show session status\n"
+        "  fairness         Show played counts\n"
         "  help             Show this help\n"
         "  quit             Save and exit\n"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Command handlers
+# --------------------------------------------------------------------------- #
+
+
+def record_played_through(rt: SessionRuntime, match_no: int) -> None:
+    if match_no < 1:
+        print("[WARN] Match number must be at least 1.")
+        return
+    if match_no <= rt.played_matches_count:
+        print("[WARN] That match number is already in the past.")
+        return
+    if match_no > len(rt.state.queue):
+        print("[WARN] That match number is beyond the current schedule.")
+        return
+
+    rt.played_matches_count = match_no
+    obj = {
+        "type": "played_through",
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "match_no": match_no,
+    }
+    rt.roster_events.append(obj)
+    append_event_jsonl(obj)
+    save_state(rt)
+    print(f"[OK] Recorded matches through #{match_no}.")
+
+
+def apply_roster_event(rt: SessionRuntime, raw_name: str, action: str, debug: bool = False) -> None:
+    players = live_players(rt)
+    player = find_player(players, raw_name)
+    if player is None:
+        print("[WARN] Could not uniquely identify that player name.")
+        return
+
+    if action == "step out":
+        if player.id in rt.abandoned_ids:
+            print(f"[WARN] {player.name} has already abandoned the session.")
+            return
+        if not player.active:
+            print(f"[WARN] {player.name} is already stepped out.")
+            return
+        updated_players = set_player_active(players, player.id, False)
+
+    elif action == "resume":
+        if player.id in rt.abandoned_ids:
+            print(f"[WARN] {player.name} has abandoned the session and cannot resume.")
+            return
+        if player.active:
+            print(f"[WARN] {player.name} is already active.")
+            return
+        updated_players = set_player_active(players, player.id, True)
+
+    elif action == "abandon":
+        if player.id in rt.abandoned_ids:
+            print(f"[WARN] {player.name} has already abandoned the session.")
+            return
+        updated_players = set_player_active(players, player.id, False)
+        rt.abandoned_ids.add(player.id)
+
+    else:
+        print("[WARN] Unknown action.")
+        return
+
+    if action == "resume":
+        rt.abandoned_ids.discard(player.id)
+
+    sched = Scheduler(rt.base_cfg, params=rt.params, debug=debug)
+    applies_from = sched.next_unplayed_game_no(rt.state, rt.played_matches_count)
+    rt.state = sched.regenerate_schedule(
+        rt.state,
+        rt.played_matches_count,
+        updated_players=updated_players,
+        regen_policy="next_unplayed",
+    )
+
+    obj = {
+        "type": "roster_event",
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "at_match": rt.next_match_number,
+        "applies_from_match": applies_from,
+        "player_id": player.id,
+        "player_name": player.name,
+        "action": action,
+    }
+    rt.roster_events.append(obj)
+    append_event_jsonl(obj)
+    save_state(rt)
+    print(f"[OK] Applied: {player.name} {action}. Change takes effect from match #{applies_from} onward.")
+
+
+def apply_rank_change(rt: SessionRuntime, raw_name: str, new_rank: int, debug: bool = False) -> None:
+    players = live_players(rt)
+    player = find_player(players, raw_name)
+    if player is None:
+        print("[WARN] Could not uniquely identify that player name.")
+        return
+
+    updated_players = move_player_to_rank(players, player.id, new_rank)
+
+    sched = Scheduler(rt.base_cfg, params=rt.params, debug=debug)
+    applies_from = sched.next_round_boundary_game_no(rt.state, rt.played_matches_count)
+    rt.state = sched.regenerate_schedule(
+        rt.state,
+        rt.played_matches_count,
+        updated_players=updated_players,
+        regen_policy="round_boundary",
+    )
+
+    obj = {
+        "type": "rank_change",
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "at_match": rt.next_match_number,
+        "applies_from_match": applies_from,
+        "player_id": player.id,
+        "player_name": player.name,
+        "new_rank": new_rank,
+    }
+    rt.roster_events.append(obj)
+    append_event_jsonl(obj)
+    save_state(rt)
+    print(f"[OK] Applied: {player.name} rank {new_rank}. Change takes effect from match #{applies_from} onward.")
+
+
+# --------------------------------------------------------------------------- #
+# Command parsing
+# --------------------------------------------------------------------------- #
 
 
 def parse_command(raw: str) -> Tuple[str, Optional[str], Optional[str]]:
@@ -487,109 +565,124 @@ def parse_command(raw: str) -> Tuple[str, Optional[str], Optional[str]]:
 
     m = re.fullmatch(r"(.+?)\s+(step out|resume|abandon)", s, flags=re.IGNORECASE)
     if m:
-        name = m.group(1).strip()
-        action = m.group(2).strip().lower()
-        return ("roster", name, action)
+        return ("roster", m.group(1).strip(), m.group(2).strip().lower())
+
+    m = re.fullmatch(r"(.+?)\s+rank\s+(\d+)", s, flags=re.IGNORECASE)
+    if m:
+        return ("rank", m.group(1).strip(), m.group(2).strip())
 
     return ("unknown", None, None)
 
 
-# ---------------------------- Main ----------------------------
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+
 
 def main() -> None:
     ensure_outputs_dir()
 
     print("=== Session Setup ===")
-    base_cfg = load_players_json(PLAYERS_JSON)
+    if not os.path.exists(PLAYERS_JSON):
+        print(f"[ERROR] {PLAYERS_JSON} not found. Run app.py first.")
+        sys.exit(1)
+
+    base_cfg = load_config(PLAYERS_JSON)
     print(f"Courts: {base_cfg.court_no}, Duration: {base_cfg.court_duration} min, Players: {base_cfg.player_amount}")
 
     try:
         avg = int(input("Average minutes per match [10]: ").strip() or "10")
     except Exception:
         avg = 10
+
     try:
         seed = int(input("Random seed [42]: ").strip() or "42")
     except Exception:
         seed = 42
-    debug = (input("Debug mode? [y/N]: ").strip().lower() == "y")
+
+    debug = input("Debug mode? [y/N]: ").strip().lower() == "y"
 
     params = ScheduleParams(
         average_match_minutes=avg,
         rank_tolerance=1,
-        rank_tolerance_opp_extra=1,
-        enforce_gender_priority=True,
         random_seed=seed,
         fairness="med",
     )
 
-    rt = SessionRuntime(
-        base_cfg=base_cfg,
-        params=params,
-        player_states=build_initial_player_states(base_cfg),
-    )
-
+    rt: Optional[SessionRuntime] = None
     resume_ok = same_player_roster(base_cfg, SNAPSHOT_JSON)
+
     if resume_ok and os.path.exists(STATE_JSON):
         yn = input("Resume previous session state? [Y/n]: ").strip().lower()
         if yn in ("", "y", "yes"):
-            if load_state(rt):
+            rt = load_saved_runtime(base_cfg)
+            if rt is not None:
                 print("[OK] Previous session state loaded.")
             else:
                 print("[WARN] Could not load previous session state. Starting fresh.")
         else:
-            if os.path.exists(STATE_JSON):
-                os.remove(STATE_JSON)
-            if os.path.exists(EVENTS_JSONL):
-                os.remove(EVENTS_JSONL)
-    else:
-        if os.path.exists(STATE_JSON):
-            print("[INFO] Player base changed or no snapshot — clearing old session state.")
-            os.remove(STATE_JSON)
-        if os.path.exists(EVENTS_JSONL):
-            os.remove(EVENTS_JSONL)
+            clear_old_runtime_files()
 
-    save_players_snapshot(base_cfg, SNAPSHOT_JSON)
-    regenerate_queue(rt)
-    save_state(rt)
+    if rt is None:
+        if not resume_ok:
+            clear_old_runtime_files()
+        rt = build_fresh_runtime(base_cfg, params=params, debug=debug)
+        save_players_snapshot(base_cfg, SNAPSHOT_JSON)
+        save_state(rt)
 
     print_help()
     show_status(rt)
     show_queue(rt)
 
     while True:
-        prompt = f"match #{rt.next_match_number}> "
-        raw = input(prompt)
+        raw = input(f"match #{rt.next_match_number}> ")
         cmd, arg1, arg2 = parse_command(raw)
 
         if cmd == "":
             continue
+
         if cmd == "unknown":
             print("[WARN] Command not recognised. Type 'help'.")
             continue
+
         if cmd == "help":
             print_help()
             continue
+
         if cmd in {"quit", "exit"}:
             save_state(rt)
-            print("Session saved. Have a great one! 👏")
+            print("Session saved. Done.")
             break
+
         if cmd == "show":
             show_queue(rt)
             continue
+
         if cmd == "status":
             show_status(rt)
             continue
+
         if cmd == "fairness":
             show_fairness(rt)
             continue
+
         if cmd == "played":
-            record_played_through(rt, int(arg1))
+            record_played_through(rt, int(arg1 or "0"))
             if debug:
                 show_fairness(rt)
             show_queue(rt)
             continue
+
         if cmd == "roster":
-            apply_roster_event(rt, arg1 or "", arg2 or "")
+            apply_roster_event(rt, arg1 or "", arg2 or "", debug=debug)
+            if debug:
+                show_fairness(rt)
+            show_status(rt)
+            show_queue(rt)
+            continue
+
+        if cmd == "rank":
+            apply_rank_change(rt, arg1 or "", int(arg2 or "0"), debug=debug)
             if debug:
                 show_fairness(rt)
             show_status(rt)
